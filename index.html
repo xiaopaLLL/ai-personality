@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI 人格测试 · 16 道题测出你的人机协作人格</title>
+<meta name="description" content="16 道选择题，测出你在人机协作里的 AI 人格类型。共 16 种人格，附优势、盲点与使用建议。">
+<meta name="theme-color" content="#070716">
+<meta property="og:type" content="website">
+<meta property="og:title" content="AI 人格测试">
+<meta property="og:description" content="16 道题，测出你在人机协作里的真实人格。">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>🧠</text></svg>">
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="shell">
+
+  <div class="topbar">
+    <div class="brand"><span class="dot"></span><span id="brandName">AI 人格测试</span></div>
+    <div><span class="chip" id="backendChip">本地预览模式</span></div>
+  </div>
+
+  <main>
+    <!-- ============================ 首屏 ============================ -->
+    <section id="screen-intro" class="card hero">
+      <h1 id="introTitle">AI 人格测试</h1>
+      <p class="sub" id="introSub"></p>
+      <div class="meta">
+        <span class="chip" id="metaCount">16 道题</span>
+        <span class="chip" id="metaTime">约 3 分钟</span>
+        <span class="chip">16 种人格类型</span>
+      </div>
+
+      <div class="intro-box" id="introText"></div>
+
+      <div id="resumeBox" class="resume-box hidden">
+        <span id="resumeText"></span>
+        <span>
+          <button class="btn btn-ghost" id="resumeBtn" style="padding:6px 12px;font-size:13px">继续作答</button>
+          <button class="btn btn-ghost" id="resumeDiscard" style="padding:6px 12px;font-size:13px">不要了</button>
+        </span>
+      </div>
+
+      <div class="field" id="nicknameField">
+        <label for="nickname">昵称（可留空）</label>
+        <input class="input" id="nickname" type="text" maxlength="20" autocomplete="off" placeholder="昵称（可留空）">
+      </div>
+
+      <label class="consent" id="consentField">
+        <input type="checkbox" id="consent">
+        <span id="consentText">同意匿名记录作答数据。</span>
+      </label>
+
+      <div class="btn-row center" style="margin-top:22px">
+        <button class="btn btn-primary" id="startBtn">开始测试 →</button>
+      </div>
+
+      <details class="type-details">
+        <summary>先看看 16 种 AI 人格长什么样</summary>
+        <div class="type-grid" id="typeGrid"></div>
+      </details>
+    </section>
+
+    <!-- ============================ 答题页 ============================ -->
+    <section id="screen-quiz" class="hidden">
+      <div class="quiz-head">
+        <span id="qCounter">第 1 / 16 题</span>
+        <span id="qPct">0%</span>
+      </div>
+      <div class="progress"><i id="progressFill"></i></div>
+      <div class="card" id="qCard">
+        <div class="q-index" id="qIndex">QUESTION 01</div>
+        <h2 class="q-text" id="qText"></h2>
+        <div class="options" id="options"></div>
+        <div class="quiz-footer">
+          <button class="btn btn-ghost" id="backBtn">← 上一题</button>
+          <span class="hint-key">键盘：1 / 2 / 3 选择，← 返回</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 结果页 ============================ -->
+    <section id="screen-result" class="hidden"></section>
+
+    <!-- ========================= 分享落地页 ========================= -->
+    <section id="screen-shared" class="hidden"></section>
+  </main>
+
+  <footer class="site-footer">
+    <div id="footerNote"></div>
+    <div style="margin-top:6px" id="footerLinks">
+      <a href="admin.html">数据后台</a>
+    </div>
+  </footer>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="config.js"></script>
+<script src="assets/js/questions.js"></script>
+<script src="assets/js/personality.js"></script>
+<script src="assets/js/store.js"></script>
+<script src="assets/js/app.js"></script>
+</body>
+</html>

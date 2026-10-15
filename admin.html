@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 人格测试 · 数据后台</title>
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#070716">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>📊</text></svg>">
+<link rel="stylesheet" href="assets/css/style.css">
+<link rel="stylesheet" href="assets/css/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+
+  <!-- ============================ 登录页 ============================ -->
+  <section id="viewLogin" class="login-wrap hidden">
+    <div class="card">
+      <h1>数据后台登录</h1>
+      <p class="desc">用你在 Supabase 里创建的邮箱账号登录（只有你能看到访客数据）。</p>
+      <div id="loginMsg"></div>
+      <form id="loginForm">
+        <div class="field">
+          <label for="loginEmail">邮箱</label>
+          <input class="input" id="loginEmail" type="email" autocomplete="username" placeholder="you@example.com" required>
+        </div>
+        <div class="field">
+          <label for="loginPwd">密码</label>
+          <input class="input" id="loginPwd" type="password" autocomplete="current-password" placeholder="••••••••" required>
+        </div>
+        <div class="btn-row" style="margin-top:20px">
+          <button class="btn btn-primary" id="loginBtn" type="submit" style="width:100%">登录</button>
+        </div>
+      </form>
+
+      <div class="btn-row" style="margin-top:12px">
+        <button class="btn btn-ghost" id="diagBtnLogin" type="button" style="width:100%">登录不上去？点这里运行诊断</button>
+      </div>
+
+      <p class="faint" style="margin-top:16px">
+        还没建账号？见 <a href="README.md">README.md</a> 第 3 步：Supabase → Authentication → Users → Add user（记得勾 <b>Auto Confirm User</b>，否则登录会报邮箱未确认）。
+      </p>
+      <p class="faint"><a href="index.html">← 回到测试页</a></p>
+    </div>
+    <div id="diagBoxLogin" class="diag-box hidden"></div>
+  </section>
+
+  <!-- ============================ 看板 ============================ -->
+  <section id="viewDash" class="hidden">
+    <div class="admin-head">
+      <div>
+        <h1 id="adminTitle">AI 人格测试 · 数据后台</h1>
+        <div class="sub">
+          <span id="modeChip" class="chip">数据源</span>
+          <span class="chip" id="userEmail"></span>
+        </div>
+      </div>
+      <div class="admin-actions">
+        <button class="btn" id="refreshBtn">↻ 刷新</button>
+        <button class="btn" id="exportCsv">导出 CSV</button>
+        <button class="btn" id="exportJson">导出 JSON</button>
+        <button class="btn btn-ghost" id="importJson">导入 JSON</button>
+        <button class="btn btn-ghost" id="diagBtnDash">运行诊断</button>
+        <button class="btn btn-ghost hidden" id="logoutBtn">退出登录</button>
+        <input type="file" id="importFile" accept=".json,application/json" class="hidden">
+      </div>
+    </div>
+
+    <div id="notice" class="notice hidden"></div>
+    <div id="diagBoxDash" class="diag-box hidden"></div>
+
+    <div class="kpis" id="kpis"></div>
+
+    <div class="filters">
+      <select id="filterRange">
+        <option value="all">全部时间</option>
+        <option value="today">今天</option>
+        <option value="7d">最近 7 天</option>
+        <option value="30d">最近 30 天</option>
+        <option value="custom">自定义区间</option>
+      </select>
+      <span id="customRange" class="hidden">
+        <input class="input" type="date" id="filterFrom"> ~
+        <input class="input" type="date" id="filterTo">
+      </span>
+      <select id="filterCode"><option value="">全部类型</option></select>
+      <input class="input" id="filterKw" type="search" placeholder="搜索昵称 / 设备 / 来源 …">
+      <label id="mergeLocalRow"><input type="checkbox" id="mergeLocal"> 合并本机数据</label>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel-card">
+        <h2>人格类型分布</h2>
+        <div class="desc">16 种类型的占比（按当前筛选）</div>
+        <div id="typeChart"></div>
+      </div>
+      <div class="panel-card">
+        <h2>四维度倾向</h2>
+        <div class="desc">每个维度里各占多少比例</div>
+        <div id="dimChart"></div>
+      </div>
+    </div>
+
+    <div class="panel-card">
+      <h2>最近 14 天作答趋势</h2>
+      <div class="desc">鼠标悬停查看具体日期人数</div>
+      <div class="trend" id="trendChart"></div>
+    </div>
+
+    <div class="panel-card">
+      <h2>单题选项分布</h2>
+      <div class="desc">每一题各选项被选中的次数，可以用来判断题目是否区分度太低</div>
+      <div id="questionStats"></div>
+    </div>
+
+    <div class="panel-card">
+      <h2>作答明细</h2>
+      <div class="desc" id="tableInfo"></div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>提交时间</th>
+              <th>结果</th>
+              <th>昵称</th>
+              <th>用时</th>
+              <th>四维度倾向</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody"></tbody>
+        </table>
+      </div>
+      <div class="btn-row" id="pager" style="margin-top:14px"></div>
+    </div>
+
+    <p class="faint">
+      提示：CSV 导出的内容包含每道题的原始选择，可直接用 Excel / Python 做进一步分析。删除操作不可恢复。
+    </p>
+  </section>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="config.js"></script>
+<script src="assets/js/questions.js"></script>
+<script src="assets/js/personality.js"></script>
+<script src="assets/js/store.js"></script>
+<script src="assets/js/admin.js"></script>
+</body>
+</html>

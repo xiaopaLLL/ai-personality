@@ -1,0 +1,18 @@
+{
+  "name": "ai-personality-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI 人格测试：纯静态问卷网站 + 数据后台（GitHub Pages + Supabase 可直接部署）",
+  "scripts": {
+    "test": "node tests/engine.test.mjs && node tests/smoke.mjs && node tests/e2e.mjs && node tests/e2e-supabase.mjs",
+    "test:unit": "node tests/engine.test.mjs",
+    "test:smoke": "node tests/smoke.mjs",
+    "test:e2e": "node tests/e2e.mjs",
+    "test:supabase": "node tests/e2e-supabase.mjs",
+    "check": "node tests/check-supabase.mjs",
+    "serve": "node tests/serve.mjs 8000",
+    "shots": "node tests/screenshots.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

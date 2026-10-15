@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>E2E · Supabase 链路（mock）</title>
+<style>
+  body { background:#0b0b18; color:#e8e8ff; font-family:Consolas,monospace; margin:0; padding:12px; }
+  #log { white-space:pre-wrap; font-size:14px; line-height:1.6; }
+  iframe { width:1000px; height:420px; border:1px solid #333; }
+</style>
+</head>
+<body>
+<pre id="log">running…</pre>
+<iframe id="quizFrame" src="/index.html"></iframe>
+<iframe id="adminFrame" src="/admin.html"></iframe>
+
+<script>
+var lines = [];
+function log(s) { lines.push(s); document.getElementById('log').textContent = lines.join('\n'); }
+function check(name, cond, extra) {
+  log((cond ? 'RESULT PASS ' : 'RESULT FAIL ') + name + (cond ? '' : '  ← ' + (extra === undefined ? 'false' : extra)));
+}
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+function waitFor(fn, timeout) {
+  var t0 = Date.now(); timeout = timeout || 8000;
+  return new Promise(function (res, rej) {
+    (function tick() {
+      var v; try { v = fn(); } catch (e) { v = null; }
+      if (v) return res(v);
+      if (Date.now() - t0 > timeout) return rej(new Error('timeout'));
+      setTimeout(tick, 60);
+    })();
+  });
+}
+
+['quizFrame', 'adminFrame'].forEach(function (id) {
+  try {
+    document.getElementById(id).contentWindow.addEventListener('error', function (e) {
+      log('RESULT FAIL [' + id + '] 页面 JS 错误: ' + e.message);
+    });
+  } catch (e) { /* ignore */ }
+});
+
+window.addEventListener('load', function () { run(); });
+
+async function run() {
+  try {
+    var MOCK = await (await fetch('/__config')).json();
+    var qw = document.getElementById('quizFrame').contentWindow;
+    var qd = qw.document;
+    var aw = document.getElementById('adminFrame').contentWindow;
+    var ad = aw.document;
+
+    /* ---------- 1. 前端确认是 supabase 模式 ---------- */
+    await waitFor(function () { return qd.getElementById('typeGrid').children.length; });
+    check('前端读取到 supabase 配置', qw.APP_CONFIG.backend === 'supabase', qw.APP_CONFIG.backend);
+    check('角标显示"数据已接入云端"', /云端/.test(qd.getElementById('backendChip').textContent),
+      qd.getElementById('backendChip').textContent);
+
+    /* ---------- 2. 答完题并提交到 mock Supabase ---------- */
+    qd.getElementById('consent').checked = true;
+    qd.getElementById('nickname').value = '云端测试';
+    qd.getElementById('startBtn').click();
+    await waitFor(function () { return !qd.getElementById('screen-quiz').classList.contains('hidden'); });
+    var guard = 0;
+    while (qd.getElementById('screen-result').classList.contains('hidden') && guard++ < 40) {
+      var btns = qd.querySelectorAll('#options .option');
+      if (!btns.length) break;
+      btns[guard % btns.length].click();
+      await sleep(300);
+    }
+    check('答题完成并进入结果页', !qd.getElementById('screen-result').classList.contains('hidden'));
+    var code = qd.querySelector('#screen-result .type-code').textContent;
+
+    await waitFor(function () { return /已记录|暂存|未接入/.test(qd.getElementById('uploadHint').textContent); });
+    check('结果页提示"作答数据已记录"',
+      /作答数据已记录/.test(qd.getElementById('uploadHint').textContent),
+      qd.getElementById('uploadHint').textContent);
+
+    var reqs = await (await fetch('/__requests')).json();
+    var post = reqs.filter(function (r) { return r.method === 'POST' && r.path === '/rest/v1/ai_personality_responses'; })[0];
+    check('确实向 /rest/v1/表名 发起了 POST', !!post);
+    check('请求带上了 apikey（anon key）', !!post && post.apikey === MOCK.anonKey, post && post.apikey);
+    check('请求使用 Authorization: Bearer <anon key>', !!post && post.auth === 'Bearer ' + MOCK.anonKey, post && post.auth);
+    check('请求带 Prefer: return=minimal', !!post && post.prefer === 'return=minimal', post && post.prefer);
+    var sentRecord = null;
+    try { sentRecord = JSON.parse(post.body); } catch (e) { /* ignore */ }
+    check('提交的 JSON 里有 id / 结果代码 / 16 题答案',
+      !!sentRecord && !!sentRecord.id && sentRecord.result_code === code &&
+      Object.keys(sentRecord.answers || {}).length === 16);
+    check('提交的记录带上了昵称', !!sentRecord && sentRecord.nickname === '云端测试', sentRecord && sentRecord.nickname);
+    var serverRows = await (await fetch('/__rows')).json();
+    check('服务端（模拟库）里确实多了 1 条', serverRows.length === 1, serverRows.length);
+
+    /* ---------- 3. 后台：未登录时应显示登录页 ---------- */
+    await waitFor(function () { return !ad.getElementById('viewLogin').classList.contains('hidden') ||
+      !ad.getElementById('viewDash').classList.contains('hidden'); });
+    check('后台未登录时显示登录页', !ad.getElementById('viewLogin').classList.contains('hidden'));
+    check('后台未登录时不显示数据看板', ad.getElementById('viewDash').classList.contains('hidden'));
+
+    /* ---------- 4. 密码错误 → 提示错误，不进入看板 ---------- */
+    ad.getElementById('loginEmail').value = 'admin@test.com';
+    ad.getElementById('loginPwd').value = 'wrong-password';
+    ad.getElementById('loginForm').dispatchEvent(new qw.Event('submit', { bubbles: true, cancelable: true }));
+    await waitFor(function () { return /Invalid|失败|错误/.test(ad.getElementById('loginMsg').textContent); });
+    check('密码错误时提示登录失败', /Invalid login credentials/.test(ad.getElementById('loginMsg').textContent),
+      ad.getElementById('loginMsg').textContent);
+    check('密码错误时仍停留在登录页', ad.getElementById('viewDash').classList.contains('hidden'));
+
+    /* ---------- 5. 正确登录 → 拉到远端数据 ---------- */
+    ad.getElementById('loginEmail').value = 'admin@test.com';
+    ad.getElementById('loginPwd').value = 'secret123';
+    ad.getElementById('loginForm').dispatchEvent(new qw.Event('submit', { bubbles: true, cancelable: true }));
+    await waitFor(function () { return ad.getElementById('tableBody').querySelectorAll('tr[data-id]').length; });
+    check('登录成功后进入数据看板', !ad.getElementById('viewDash').classList.contains('hidden') &&
+      ad.getElementById('viewLogin').classList.contains('hidden'));
+    check('看板显示登录邮箱', /admin@test\.com/.test(ad.getElementById('userEmail').textContent),
+      ad.getElementById('userEmail').textContent);
+    check('看板显示"Supabase 云端数据库"', /Supabase/.test(ad.getElementById('modeChip').textContent),
+      ad.getElementById('modeChip').textContent);
+    check('拉到远端 1 条作答', ad.getElementById('tableBody').querySelectorAll('tr[data-id]').length === 1);
+    check('表格里的类型和作答一致', ad.getElementById('tableBody').textContent.indexOf(code) >= 0);
+    check('KPI 卡片渲染 5 个', ad.getElementById('kpis').children.length === 5);
+    check('单题分布 16 题', ad.getElementById('questionStats').querySelectorAll('.q-block').length === 16);
+
+    var getReq = (await (await fetch('/__requests')).json())
+      .filter(function (r) { return r.method === 'GET' && r.path === '/rest/v1/ai_personality_responses'; })[0];
+    check('读取数据用了登录后的 access_token（不是 anon key）',
+      !!getReq && getReq.auth === 'Bearer ACCESS_TOKEN_TEST', getReq && getReq.auth);
+
+    /* ---------- 6. 删除 → 打到服务端 ---------- */
+    ad.querySelector('#tableBody button[data-act="toggle"]').click();
+    await sleep(150);
+    check('详情能展开', ad.querySelectorAll('#tableBody .detail-cell').length === 1);
+    aw.confirm = function () { return true; };
+    ad.querySelector('#tableBody button[data-act="del"]').click();
+    await waitFor(function () { return ad.getElementById('tableBody').querySelectorAll('tr[data-id]').length === 0; });
+    var delReq = (await (await fetch('/__requests')).json())
+      .filter(function (r) { return r.method === 'DELETE'; })[0];
+    check('删除发出了 DELETE 请求（带 id 条件）', !!delReq && /id=eq\./.test(delReq.search), delReq && delReq.search);
+    var rowsAfter = await (await fetch('/__rows')).json();
+    check('服务端记录已被删除', rowsAfter.length === 0, rowsAfter.length);
+
+    /* ---------- 7. 故障场景：登录失败时不能只说一句"登录失败" ---------- */
+
+    // 7a. 邮箱未确认的账号 → 必须给出中文、可操作的解决办法
+    ad.getElementById('logoutBtn').click();
+    await waitFor(function () { return !ad.getElementById('viewLogin').classList.contains('hidden'); });
+    check('退出登录后回到登录页', !ad.getElementById('viewLogin').classList.contains('hidden'));
+    ad.getElementById('loginEmail').value = 'unconfirmed@test.com';
+    ad.getElementById('loginPwd').value = 'whatever';
+    ad.getElementById('loginForm').dispatchEvent(new qw.Event('submit', { bubbles: true, cancelable: true }));
+    await waitFor(function () { return /登录失败/.test(ad.getElementById('loginMsg').textContent); });
+    var loginTxt = ad.getElementById('loginMsg').textContent;
+    check('邮箱未确认时提示"邮箱还没确认"并给出解决办法',
+      /邮箱还没确认/.test(loginTxt) && /Confirm email/.test(loginTxt), loginTxt.slice(0, 120));
+    check('同时显示 Supabase 原始错误（方便排查）', /Email not confirmed/.test(loginTxt));
+
+    // 7b. 表不存在（schema.sql 没跑）→ 登录成功后不能把用户踢回登录页
+    await fetch('/__mode?set=no_table');
+    ad.getElementById('loginEmail').value = 'admin@test.com';
+    ad.getElementById('loginPwd').value = 'secret123';
+    ad.getElementById('loginForm').dispatchEvent(new qw.Event('submit', { bubbles: true, cancelable: true }));
+    await waitFor(function () { return /schema\.sql|不存在/.test(ad.getElementById('notice').textContent); });
+    check('登录本身不算失败：仍停留在看板', !ad.getElementById('viewDash').classList.contains('hidden') &&
+      ad.getElementById('viewLogin').classList.contains('hidden'));
+    check('提示数据表不存在并指出要跑 schema.sql',
+      /数据表不存在/.test(ad.getElementById('notice').textContent) && /schema\.sql/.test(ad.getElementById('notice').textContent),
+      ad.getElementById('notice').textContent.slice(0, 140));
+
+    // 7c. 诊断按钮：表不存在时必须报红并给出修复建议
+    ad.getElementById('diagBtnDash').click();
+    await waitFor(function () { return ad.querySelectorAll('#diagBoxDash .diag-line').length >= 4; });
+    await sleep(800);
+    var diagTxt = ad.getElementById('diagBoxDash').textContent;
+    check('诊断面板列出了检查项', ad.querySelectorAll('#diagBoxDash .diag-line').length >= 5,
+      ad.querySelectorAll('#diagBoxDash .diag-line').length);
+    check('诊断能测出 anonKey 有效', /anonKey 有效/.test(diagTxt), diagTxt.slice(0, 160));
+    check('诊断能测出数据表不存在', /不存在/.test(diagTxt), diagTxt.slice(0, 220));
+    check('诊断能确认账号密码可登录', /账号密码可以登录/.test(diagTxt), diagTxt.slice(-200));
+
+    // 7d. RLS 异常（匿名可读表）也要能被诊断出来
+    await fetch('/__mode?set=anon_readable');
+    ad.getElementById('diagBtnDash').click();
+    await waitFor(function () { return /RLS 没生效/.test(ad.getElementById('diagBoxDash').textContent); });
+    check('诊断能发现 RLS 没生效（匿名可读表）', /RLS 没生效/.test(ad.getElementById('diagBoxDash').textContent));
+
+    // 7e. 恢复正常后刷新应能正常加载
+    await fetch('/__mode?set=ok');
+    ad.getElementById('refreshBtn').click();
+    await waitFor(function () { return !/不存在/.test(ad.getElementById('notice').textContent); });
+    check('恢复后刷新能正常加载（错误提示消失）', !/不存在/.test(ad.getElementById('notice').textContent),
+      ad.getElementById('notice').textContent.slice(0, 80));
+
+    // 7f. anonKey 填错时，诊断必须能识别出来
+    var goodKey = aw.APP_CONFIG.supabase.anonKey;
+    aw.APP_CONFIG.supabase.anonKey = 'WRONG_KEY';
+    ad.getElementById('diagBtnDash').click();
+    await waitFor(function () { return /anonKey/.test(ad.getElementById('diagBoxDash').textContent); });
+    await sleep(1000);
+    check('anonKey 填成随意字符串时能识别',
+      /不是 Supabase 的 key|重新复制/.test(ad.getElementById('diagBoxDash').textContent),
+      ad.getElementById('diagBoxDash').textContent.slice(0, 160));
+
+    // 7g. ★ 用户真实踩的坑：key 复制残缺（签名 44 字符 = 33 字节，正常应为 43 字符 = 32 字节）
+    aw.APP_CONFIG.supabase.anonKey = MOCK.garbledKey;
+    ad.getElementById('diagBtnDash').click();
+    await waitFor(function () { return /签名长度/.test(ad.getElementById('diagBoxDash').textContent); });
+    await sleep(1000);
+    var garbleTxt = ad.getElementById('diagBoxDash').textContent;
+    check('能查出「key 复制残缺」，并给出字节数/字符数',
+      /签名长度：33 字节/.test(garbleTxt) && /44 个字符/.test(garbleTxt) && /复制残缺/.test(garbleTxt),
+      garbleTxt.slice(0, 240));
+    check('残缺 key 被标成红色问题（不是警告）', !!ad.querySelector('#diagBoxDash .diag-line.bad'));
+
+    // 7h. 误把 service_role 放进前端 —— 必须明确警告
+    aw.APP_CONFIG.supabase.anonKey = MOCK.serviceRoleKey;
+    ad.getElementById('diagBtnDash').click();
+    await waitFor(function () { return /service_role/.test(ad.getElementById('diagBoxDash').textContent); });
+    await sleep(1000);
+    check('能查出误用 service_role 并警告不能放前端',
+      /service_role/.test(ad.getElementById('diagBoxDash').textContent) &&
+      /绝对不能放在前端/.test(ad.getElementById('diagBoxDash').textContent),
+      ad.getElementById('diagBoxDash').textContent.slice(0, 200));
+
+    aw.APP_CONFIG.supabase.anonKey = goodKey;
+  } catch (e) {
+    log('RESULT FAIL 驱动异常: ' + (e && e.message));
+  }
+  var fails = lines.filter(function (l) { return l.indexOf('RESULT FAIL') === 0; }).length;
+  var passes = lines.filter(function (l) { return l.indexOf('RESULT PASS') === 0; }).length;
+  log('');
+  log('SUMMARY passed=' + passes + ' failed=' + fails);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>预览：用于截图检查</title>
+<style>
+  html, body { margin: 0; background: #070716; }
+  iframe { display: block; width: 100%; border: 0; }
+  #quiz { height: 1700px; }
+  #admin { height: 1900px; }
+  body[data-stage="quiz"] #quiz { height: 1150px; }
+  body[data-stage="quiz"] #admin, body[data-stage="result"] #admin { display: none; }
+  body[data-stage="admin"] #quiz { height: 1px; }
+</style>
+</head>
+<body>
+<iframe id="quiz" src="../index.html"></iframe>
+<iframe id="admin" src="../admin.html"></iframe>
+<script>
+var stage = (new URLSearchParams(location.search)).get('stage') || 'result';
+document.body.setAttribute('data-stage', stage);
+var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+function waitFor(fn, timeout) {
+  var t0 = Date.now(); timeout = timeout || 8000;
+  return new Promise(function (res, rej) {
+    (function tick() {
+      var v; try { v = fn(); } catch (e) { v = null; }
+      if (v) return res(v);
+      if (Date.now() - t0 > timeout) return rej(new Error('timeout'));
+      setTimeout(tick, 50);
+    })();
+  });
+}
+window.addEventListener('load', async function () {
+  var qw = document.getElementById('quiz').contentWindow;
+  var qd = qw.document;
+  await waitFor(function () { return qd.getElementById('typeGrid').children.length; });
+  qd.getElementById('consent').checked = true;
+  qd.getElementById('nickname').value = '小柯';
+  qd.getElementById('startBtn').click();
+  await waitFor(function () { return !qd.getElementById('screen-quiz').classList.contains('hidden'); });
+  await sleep(200);
+  var stop = stage === 'quiz' ? 5 : 99;
+  var guard = 0;
+  while (guard < stop && guard < 20 && qd.getElementById('screen-result').classList.contains('hidden')) {
+    var btns = qd.querySelectorAll('#options .option');
+    if (!btns.length) break;
+    btns[guard % btns.length].click();
+    guard++;
+    await sleep(300);
+  }
+  if (stage === 'admin') {
+    var ad = document.getElementById('admin').contentWindow.document;
+    await sleep(400);
+    ad.getElementById('refreshBtn').click();
+  }
+  document.title = 'preview-' + stage + '-ready';
+});
+</script>
+</body>
+</html>

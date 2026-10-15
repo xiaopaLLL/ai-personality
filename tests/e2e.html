@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>E2E · 自动答题驱动</title>
+<style>
+  body { background:#0b0b18; color:#e8e8ff; font-family: Consolas, monospace; margin:0; padding:12px; }
+  #log { white-space: pre-wrap; font-size: 14px; line-height: 1.6; margin: 0 0 14px; }
+  iframe { width: 1000px; height: 420px; border: 1px solid #333; }
+  .ok { color:#4ade80 } .bad { color:#fb7185 }
+</style>
+</head>
+<body>
+<pre id="log">running…</pre>
+
+<!-- 被测页面 1：完整答题流程 -->
+<iframe id="quizFrame" src="../index.html"></iframe>
+<!-- 被测页面 2：分享落地页 -->
+<iframe id="shareFrame" src="../index.html?result=EWSP"></iframe>
+<!-- 被测页面 3：数据后台（local 模式） -->
+<iframe id="adminFrame" src="../admin.html"></iframe>
+
+<script>
+var lines = [];
+function log(s) {
+  lines.push(s);
+  var el = document.getElementById('log');
+  el.textContent = lines.join('\n');
+  el.className = s.indexOf('FAIL') >= 0 ? 'bad' : '';
+}
+function check(name, cond, extra) {
+  log((cond ? 'RESULT PASS ' : 'RESULT FAIL ') + name + (cond ? '' : '  ← ' + (extra === undefined ? 'false' : extra)));
+}
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+function waitFor(fn, timeout, interval) {
+  timeout = timeout || 6000; interval = interval || 60;
+  var t0 = Date.now();
+  return new Promise(function (resolve, reject) {
+    (function tick() {
+      var v;
+      try { v = fn(); } catch (e) { v = null; }
+      if (v) return resolve(v);
+      if (Date.now() - t0 > timeout) return reject(new Error('等待超时'));
+      setTimeout(tick, interval);
+    })();
+  });
+}
+
+// 尽早挂上错误监听，捕获被测页面的 JS 异常
+['quizFrame', 'shareFrame', 'adminFrame'].forEach(function (id) {
+  var f = document.getElementById(id);
+  try {
+    f.contentWindow.addEventListener('error', function (e) {
+      log('RESULT FAIL [' + id + '] 页面 JS 错误: ' + e.message);
+    });
+  } catch (e) { /* ignore */ }
+});
+
+window.addEventListener('load', function () { run(); });
+
+async function run() {
+  try {
+    var qf = document.getElementById('quizFrame');
+    var qw = qf.contentWindow, qd = qw.document;
+    var sf = document.getElementById('shareFrame');
+    var sw = sf.contentWindow, sd = sw.document;
+    var af = document.getElementById('adminFrame');
+    var aw = af.contentWindow, ad = aw.document;
+
+    /* ---------------- 1. 首屏 ---------------- */
+    await waitFor(function () { return qd.getElementById('typeGrid') && qd.getElementById('typeGrid').children.length; });
+    check('首屏渲染 16 型速览', qd.getElementById('typeGrid').children.length === 16,
+      qd.getElementById('typeGrid').children.length);
+    check('首屏标题已填充', /AI 人格测试/.test(qd.getElementById('introTitle').textContent));
+    check('首屏题数正确', qd.getElementById('metaCount').textContent === '16 道题',
+      qd.getElementById('metaCount').textContent);
+    check('local 模式显示"本地预览模式"角标', qd.getElementById('backendChip').textContent === '本地预览模式',
+      qd.getElementById('backendChip').textContent);
+    check('未勾选同意时不会开始', (function () {
+      qd.getElementById('startBtn').click();
+      return qd.getElementById('screen-quiz').classList.contains('hidden');
+    })());
+
+    /* ---------------- 2. 答题流程 ---------------- */
+    qd.getElementById('consent').checked = true;
+    qd.getElementById('nickname').value = 'e2e测试,人"引号';
+    qd.getElementById('startBtn').click();
+    await waitFor(function () { return !qd.getElementById('screen-quiz').classList.contains('hidden'); });
+    check('勾选同意＋点开始后进入答题页', true);
+    check('第 1 题渲染出 3 个选项', qd.querySelectorAll('#options .option').length === 3,
+      qd.querySelectorAll('#options .option').length);
+    check('第 1 题题干非空', qd.getElementById('qText').textContent.length > 5);
+    check('进度百分比按已到题号计算（第 1 题应为 6%）', qd.getElementById('qPct').textContent === '6%',
+      qd.getElementById('qPct').textContent);
+    check('进度条宽度与百分比一致', qd.getElementById('progressFill').style.width === '6%',
+      qd.getElementById('progressFill').style.width);
+
+    // 返回上一题测试
+    qd.querySelectorAll('#options .option')[0].click();
+    await sleep(300);
+    var counterAfterFirst = qd.getElementById('qCounter').textContent;
+    qd.getElementById('backBtn').click();
+    await sleep(120);
+    check('上一题按钮可回退', qd.getElementById('qCounter').textContent === '第 1 / 16 题',
+      qd.getElementById('qCounter').textContent);
+    check('回退后仍保留已选答案', qd.querySelectorAll('#options .option')[0].classList.contains('selected'));
+    qd.querySelectorAll('#options .option')[0].click();
+    await sleep(300);
+
+    // 逐题作答（轮流选不同选项，模拟真实作答）
+    var guard = 0;
+    while (qd.getElementById('screen-result').classList.contains('hidden') && guard++ < 40) {
+      var btns = qd.querySelectorAll('#options .option');
+      if (!btns.length) break;
+      btns[guard % btns.length].click();
+      await sleep(300);
+    }
+    check('答完所有题后进入结果页', !qd.getElementById('screen-result').classList.contains('hidden'));
+    var code = qd.querySelector('#screen-result .type-code').textContent;
+    var typeName = qd.querySelector('#screen-result .type-name').textContent;
+    check('结果页显示 4 字母类型代码', /^[A-Z]{4}$/.test(code), code);
+    check('结果页显示类型中文名', typeName.length > 1, typeName);
+    check('结果页显示类型描述', qd.querySelector('#screen-result .type-desc').textContent.length > 20);
+    check('结果页三个建议面板都在', qd.querySelectorAll('#screen-result .panel').length >= 4,
+      qd.querySelectorAll('#screen-result .panel').length);
+    check('互补/同频搭档面板存在', !!qd.querySelector('#screen-result .match'));
+
+    await sleep(900);
+    var bars = qd.querySelectorAll('#screen-result .dim-bar > i');
+    check('四维度进度条已生成', bars.length === 4, bars.length);
+    var widthsOk = Array.prototype.every.call(bars, function (b) { return /%$/.test(b.style.width); });
+    check('四维度进度条已按结果设置宽度', widthsOk);
+    var sums = Array.prototype.map.call(qd.querySelectorAll('#screen-result .dim-top'), function (el) {
+      var m = el.textContent.match(/(\d+)%[\s\S]*?(\d+)%/);
+      return m ? Number(m[1]) + Number(m[2]) : -1;
+    });
+    check('每个维度左右百分比之和为 100', sums.length === 4 && sums.every(function (s) { return s === 100; }), sums.join(','));
+
+    /* ---------------- 3. 数据落库（local 模式） ---------------- */
+    var stored = [];
+    try { stored = JSON.parse(qw.localStorage.getItem('aipt:local:v1') || '[]'); } catch (e) { stored = []; }
+    check('作答记录已写入本机存储', stored.length === 1, stored.length);
+    var rec = stored[0] || {};
+    check('记录里的类型代码与页面一致', rec.result_code === code, rec.result_code + ' vs ' + code);
+    check('记录里含 16 题原始选择', Object.keys(rec.answers || {}).length === 16,
+      Object.keys(rec.answers || {}).length);
+    check('记录里含每题的答案文字（便于导出）', (rec.answer_detail || []).length === 16);
+    check('记录的昵称带逗号/引号也不会坏（CSV 转义）', rec.nickname === 'e2e测试,人"引号', rec.nickname);
+    check('记录了耗时', rec.duration_ms > 0, rec.duration_ms);
+    check('记录了问卷版本', rec.survey_version === 'v1.0', rec.survey_version);
+    check('结果页提示数据已保存/记录', /已保存|已记录/.test(qd.getElementById('uploadHint').textContent),
+      qd.getElementById('uploadHint').textContent);
+    check('答完后清除了续答进度', !qw.localStorage.getItem('aipt:progress:v1'));
+
+    /* ---------------- 4. 分享落地页 ---------------- */
+    await waitFor(function () { return sd.querySelector('#screen-shared .type-name'); });
+    check('分享页能按 ?result= 渲染对应人格',
+      sd.querySelector('#screen-shared .type-name').textContent.indexOf('提示词总导演') >= 0,
+      sd.querySelector('#screen-shared .type-name').textContent);
+    check('分享页显示对应代码', sd.querySelector('#screen-shared .type-code').textContent === 'EWSP');
+    check('分享页有"我也要测"入口', !!sd.getElementById('sharedStart'));
+
+    /* ---------------- 5. 数据后台（local 模式） ---------------- */
+    // 后台和答题页是同时加载的，所以这里点一下「刷新」，和真人操作一致
+    ad.getElementById('refreshBtn').click();
+    await waitFor(function () { return ad.getElementById('tableBody').children.length; });
+    check('后台显示"本地模式"数据源', /本地模式/.test(ad.getElementById('modeChip').textContent),
+      ad.getElementById('modeChip').textContent);
+    check('后台看板真的可见（不是空页面）',
+      !ad.getElementById('viewDash').classList.contains('hidden') &&
+      ad.getElementById('viewLogin').classList.contains('hidden'));
+    check('后台标题区域有实际尺寸（说明渲染出来了）',
+      ad.querySelector('.admin-head').getBoundingClientRect().height > 20,
+      ad.querySelector('.admin-head').getBoundingClientRect().height);
+    check('后台出现提示：数据只在本机', /只能看到/.test(ad.getElementById('notice').textContent));
+    check('后台 KPI 卡片已渲染', ad.getElementById('kpis').children.length === 5,
+      ad.getElementById('kpis').children.length);
+    check('后台总作答数为 1', /1 条/.test(ad.getElementById('tableInfo').textContent) ||
+      /1/.test(ad.getElementById('kpis').textContent), ad.getElementById('tableInfo').textContent);
+    check('后台明细表有 1 行', ad.getElementById('tableBody').querySelectorAll('tr[data-id]').length === 1);
+    check('后台类型分布图非空', ad.getElementById('typeChart').querySelectorAll('.bar-row').length >= 1);
+    check('后台四维度图有 4 条', ad.getElementById('dimChart').querySelectorAll('.bar-row').length === 4,
+      ad.getElementById('dimChart').querySelectorAll('.bar-row').length);
+    check('后台趋势图有 14 天', ad.getElementById('trendChart').querySelectorAll('.col').length === 14,
+      ad.getElementById('trendChart').querySelectorAll('.col').length);
+    check('后台单题分布非空（16 题）', ad.getElementById('questionStats').querySelectorAll('.q-block').length === 16,
+      ad.getElementById('questionStats').querySelectorAll('.q-block').length);
+
+    // 详情展开 + 列表里的类型一致
+    var detailBtn = ad.querySelector('#tableBody button[data-act="toggle"]');
+    detailBtn.click();
+    await sleep(150);
+    check('后台可以展开单条详情', ad.querySelectorAll('#tableBody .detail-cell').length === 1,
+      ad.querySelectorAll('#tableBody .detail-cell').length);
+    check('详情里含每道题的原始选择', ad.querySelectorAll('#tableBody .detail-cell dt').length >= 16,
+      ad.querySelectorAll('#tableBody .detail-cell dt').length);
+    check('后台列表里的类型与作答一致', ad.getElementById('tableBody').textContent.indexOf(code) >= 0);
+
+    // 筛选：选一个不存在的类型关键词，应清空
+    var kw = ad.getElementById('filterKw');
+    kw.value = '不存在的关键词zzz';
+    kw.dispatchEvent(new qw.Event('input', { bubbles: true }));
+    await sleep(400);
+    check('后台关键词筛选生效（无结果）', /没有符合条件/.test(ad.getElementById('tableInfo').textContent),
+      ad.getElementById('tableInfo').textContent);
+    kw.value = '';
+    kw.dispatchEvent(new qw.Event('input', { bubbles: true }));
+    await sleep(400);
+    check('清空关键词后恢复', /1 条/.test(ad.getElementById('tableInfo').textContent),
+      ad.getElementById('tableInfo').textContent);
+
+    // CSV 导出内容检查（不触发真实下载）
+    var rows = JSON.parse(qw.localStorage.getItem('aipt:local:v1'));
+    var csv = qw.Store.toCSV(rows, qw.SURVEY);
+    check('CSV 以 BOM 开头（Excel 中文不乱码）', csv.charCodeAt(0) === 0xFEFF);
+    check('CSV 转义了昵称里的逗号引号', csv.indexOf('"e2e测试,人""引号"') >= 0);
+    check('CSV 行数 = 表头 + 1 条数据', csv.trim().split('\n').length === 2, csv.trim().split('\n').length);
+
+    // 删除功能
+    var delBtn = ad.querySelector('#tableBody button[data-act="del"]');
+    qw.confirm = function () { return true; };
+    aw.confirm = function () { return true; };
+    delBtn.click();
+    await sleep(400);
+    var after = JSON.parse(qw.localStorage.getItem('aipt:local:v1') || '[]');
+    check('后台删除会同步删除本机记录', after.length === 0, after.length);
+  } catch (e) {
+    log('RESULT FAIL 驱动异常: ' + (e && e.message));
+  }
+  var fails = lines.filter(function (l) { return l.indexOf('RESULT FAIL') === 0; }).length;
+  var passes = lines.filter(function (l) { return l.indexOf('RESULT PASS') === 0; }).length;
+  log('');
+  log('SUMMARY passed=' + passes + ' failed=' + fails);
+  document.title = 'E2E ' + (fails ? 'FAILED' : 'OK') + ' ' + passes + '/' + (passes + fails);
+}
+</script>
+</body>
+</html>
