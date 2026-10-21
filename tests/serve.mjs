@@ -4,7 +4,7 @@
  *     node tests/serve.mjs 8137 --force-local # 测试用：强制 local 模式，绝不碰真实数据库
  *
  * --force-local 会往 HTML 里注入 APP_CONFIG_OVERRIDE，把 backend 锁成 local，
- * 这样即使 config.js 已经被改成 supabase，自动化测试也不会把假数据写进你的线上库。
+ * 这样即使 config.js 已经指向 Supabase，自动化测试也不会把假数据写进线上库。
  */
 import http from 'node:http';
 import fs from 'node:fs';
@@ -21,16 +21,24 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
   '.md': 'text/markdown; charset=utf-8',
   '.sql': 'text/plain; charset=utf-8',
-  '.gs': 'text/plain; charset=utf-8'
+  '.gs': 'text/plain; charset=utf-8',
+  '.webp': 'image/webp',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.txt': 'text/plain; charset=utf-8',
+  '.woff2': 'font/woff2'
 };
 
 const OVERRIDE = '<script>window.APP_CONFIG_OVERRIDE = { backend: "local", supabase: { url: "", anonKey: "" } };' +
   'window.__FORCED_LOCAL__ = true;</script>';
 
 function withOverride(html) {
-  if (html.indexOf('<script src="config.js"></script>') >= 0) {
-    return html.replace('<script src="config.js"></script>', OVERRIDE + '\n<script src="config.js"></script>');
-  }
+  // 兼容 config.js 带缓存参数（config.js?v=2.0）的写法
+  const re = /<script\s+src="(?:\.\/)?config\.js(?:\?[^"]*)?"><\/script>/;
+  if (re.test(html)) return html.replace(re, OVERRIDE + '\n$&');
   return html;
 }
 
@@ -42,7 +50,7 @@ http.createServer((req, res) => {
     res.end('404 not found: ' + urlPath);
     return;
   }
-  const ext = path.extname(file);
+  const ext = path.extname(file).toLowerCase();
   let content = fs.readFileSync(file);
   if (FORCE_LOCAL && ext === '.html') content = Buffer.from(withOverride(content.toString('utf8')), 'utf8');
   res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });

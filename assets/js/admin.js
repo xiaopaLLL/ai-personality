@@ -1,822 +1,1781 @@
 /* =============================================================================
- *  数据后台逻辑：登录 → 拉取 → 统计 → 明细 → 导出
+ *  AI 协作机体测试 · 数据后台交互（/admin.html）
+ * =============================================================================
+ *  依赖（按 index.html 相同的顺序加载）：
+ *    config.js → assets/js/questions.js → assets/js/personality.js
+ *    → assets/js/store.js → assets/js/admin.js
+ *
+ *  数据接口只使用 window.Store.admin 契约：
+ *    dataSource() / isRemote() / ready() / session() / signIn() / signOut()
+ *    fetchRows(opts) / remove(id)
+ *  以及 window.Store.toCSV(rows, SURVEY)。
+ *
+ *  三种模式：
+ *    local    跳过登录，直接看本机 localStorage 记录（看板顶部有提示条）
+ *    supabase 邮箱密码登录后读取云端数据；localStorage 有有效会话时直接进看板
+ *    custom   自定义接口模式，本后台未配置，只显示提示
+ *
+ *  安全约定：所有来自数据表的动态文本一律用 textContent / setAttribute
+ *  写入 DOM，不拼 innerHTML；删除前必须 confirm。
  * ========================================================================== */
-
 (function () {
   'use strict';
 
-  var S = window.SURVEY;
+  var S = window.SURVEY || {};
   var E = window.Engine;
   var St = window.Store;
   var CFG = window.APP_CONFIG || {};
-  var BACKEND = CFG.backend || 'local';
+  var META = S.meta || {};
+  var DIMS = S.dimensions || {};
+  var CURRENT_VERSION = META.version || 'v2.0';
+  var DIM_ORDER = (E && E.DIM_ORDER) || ['drive', 'heart', 'order', 'role'];
 
-  var $ = function (id) { return document.getElementById(id); };
-  var esc = function (s) {
-    return String(s === undefined || s === null ? '' : s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  };
-  var pct = function (n, d) { return d > 0 ? Math.round((n / d) * 100) : 0; };
+  var FETCH_LIMIT = 1000;  // 后台默认读取最近 1000 条
+  var TABLE_LIMIT = 500;   // 表格最多渲染 500 行
+  var NOTICE_MS = 4500;
 
   var state = {
+    source: 'local',
+    email: '',
     rows: [],
-    localRows: [],
-    mergeLocal: false,
-    range: 'all',
-    from: '',
-    to: '',
-    code: '',
-    kw: '',
-    page: 1,
-    pageSize: (CFG.admin && CFG.admin.pageSize) || 50,
-    expanded: {},
-    loading: false
+    filterVersion: 'new',   // new | all | old
+    filterRange: 'all',     // all | today | 7 | 30
+    filterType: '',         // '' 或 M01..M08
+    filterLegacy: '',       // 旧版四字母代码（点击旧版分布时设置）
+    loading: false,
+    loaded: false
   };
 
-  function toast(msg, kind, ms) {
-    var el = $('toast');
-    el.textContent = msg;
-    el.className = 'toast show ' + (kind || '');
-    clearTimeout(toast.__t);
-    toast.__t = setTimeout(function () { el.className = 'toast ' + (kind || ''); }, ms || 3000);
+  var els = {};
+  var noticeTimer = null;
+
+  /* ================================ 小工具 ================================ */
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
   }
 
-  function notice(html, kind) {
-    var el = $('notice');
-    if (!html) { el.classList.add('hidden'); el.innerHTML = ''; return; }
-    el.className = 'notice ' + (kind || '');
-    el.innerHTML = html;
+  function clear(node) {
+    if (!node) return;
+    while (node.firstChild) node.removeChild(node.firstChild);
   }
 
-  /** 加载成功后只清掉「读取失败」这类错误提示，别把本地模式/自定义接口的常驻提示也清掉 */
-  function clearErrorNotice() {
-    var el = $('notice');
-    if (el && !el.classList.contains('hidden') && el.className.indexOf('err') >= 0) notice('', '');
+  function on(node, event, handler) {
+    if (node && node.addEventListener) node.addEventListener(event, handler);
   }
 
-  /* ------------------------------- 登录 ------------------------------- */
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
-  function renderLogin(errMsg, rawMsg) {
-    $('viewLogin').classList.remove('hidden');
-    $('viewDash').classList.add('hidden');
-    if (errMsg) {
-      $('loginMsg').innerHTML = '<div class="notice err"><b>登录失败</b><br>' + errMsg +
-        (rawMsg ? '<div class="raw-err">Supabase 原始返回：' + esc(rawMsg) + '</div>' : '') +
-        '</div>';
-    } else {
-      $('loginMsg').innerHTML = '';
-    }
+  function messageOf(err) {
+    return (err && err.message) ? String(err.message) : '未知错误';
   }
 
-  function renderDash() {
-    $('viewLogin').classList.add('hidden');
-    $('viewDash').classList.remove('hidden');
+  function toDate(value) {
+    if (!value) return null;
+    var d = new Date(value);
+    if (isNaN(d.getTime())) {
+      // 兼容 "YYYY-MM-DD HH:mm:ss" 这类不带 T 的旧格式
+      d = new Date(String(value).replace(' ', 'T'));
+      if (isNaN(d.getTime())) return null;
+    }
+    return d;
   }
 
-  /* --------------------------- 错误翻译（说人话） --------------------------- */
-
-  function rawOf(err) { return (err && err.message) || String(err || ''); }
-
-  /** 登录失败时说清楚到底哪里错了 */
-  function explainAuthError(err) {
-    var msg = rawOf(err);
-    var status = err && err.status;
-    if (/请先在 config/.test(msg)) return msg;
-    if (/Invalid login credentials|invalid_credentials/i.test(msg)) {
-      return '邮箱或密码不对。也可能是：① 这个账号不是在 Authentication → Users 里建的；' +
-        '② 建用户时没勾 Auto Confirm User（邮箱没确认，登录会被拒）；③ 密码记错了——' +
-        '可以在 Supabase 里给该用户 Reset password 重设一个。';
-    }
-    if (/Email not confirmed|email_not_confirmed/i.test(msg)) {
-      return '账号存在，但邮箱还没确认。去 Supabase → Authentication → Users，找到这个用户，' +
-        '点右侧「…」→ Confirm email；或者删掉重建，创建时勾选 Auto Confirm User。';
-    }
-    if (/User not found|user_not_found/i.test(msg)) {
-      return '这个邮箱在 Supabase 里不存在。去 Authentication → Users → Add user 新建一个（记得勾 Auto Confirm User）。';
-    }
-    if (/Invalid API key|No API key|invalid_api_key/i.test(msg)) {
-      return '这个 anonKey 被 Supabase 拒绝了（Invalid API key），所以连登录接口都调不通。' +
-        '最常见原因是复制时多/少了一个字符（比如 key 结尾的签名长度不对），其次是 key 和 URL 不是同一个项目，' +
-        '或者把 service_role 密钥当成了 anon key。点下面「运行诊断」，第一屏就能看出是哪种。';
-    }
-    if (/rate limit|Too many requests|over_email_send_rate_limit|too_many_requests/i.test(msg)) {
-      return '短时间内失败太多次，被 Supabase 限流了。等 5~10 分钟再试。';
-    }
-    if (/Failed to fetch|NetworkError|Load failed|Network request failed/i.test(msg)) {
-      return '请求根本发不出去。检查：① config.js 的 supabase.url 是否写错；② 页面是不是用 file:// 直接打开的（要用 http 地址）；' +
-        '③ 网络/代理是否拦了 *.supabase.co。点下面「运行诊断」看具体卡在哪一步。';
-    }
-    if (/Auth session missing|session_not_found/i.test(msg)) return '登录状态丢了，重新登录一次即可。';
-    if (status === 401 || status === 403) {
-      return '认证被拒绝（HTTP ' + status + '）。多半是 url 和 anonKey 不是同一个项目，' +
-        '或者把 service_role / JWT Secret 当成 anon key 填进去了。建议点「运行诊断」逐项检查。';
-    }
-    return msg || '未知错误';
-  }
-
-  /** 拉数据失败时说清楚到底哪里错了 */
-  function explainDataError(err) {
-    var msg = rawOf(err);
-    var status = err && err.status;
-    var code = err && err.data && (err.data.code || err.data.error_code);
-    if (code === 'PGRST205' || /Could not find the table|does not exist|relation .* does not exist/i.test(msg)) {
-      return '❌ 数据表不存在：<code>' + esc((CFG.supabase || {}).table || '') + '</code>。' +
-        '解决：打开 Supabase → SQL Editor → 把 <code>supabase/schema.sql</code> 全文粘贴 → Run。';
-    }
-    if (status === 401 || /permission denied|Invalid API key/i.test(msg)) {
-      return '❌ 没有读取权限（HTTP ' + status + '）。两种情况：① 你还没登录成功；' +
-        '② <code>schema.sql</code> 里的 RLS 读取策略没跑上（auth_can_read）。请重跑一遍 schema.sql，然后退出重新登录。';
-    }
-    if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) {
-      return '❌ 连不上 Supabase：检查 <code>config.js</code> 的 <code>supabase.url</code>、页面是否用 http 打开、网络是否通。';
-    }
-    return '❌ 读取数据失败：' + esc(msg) + '（可点右上角「运行诊断」看详细原因）';
-  }
-
-  /* ------------------------------ 数据加载 ------------------------------ */
-
-  function load() {
-    if (state.loading) return;
-    state.loading = true;
-    $('refreshBtn').disabled = true;
-    var p = St.admin.fetchRows({ limit: 5000 });
-    p.then(function (rows) {
-      state.rows = (rows || []).map(normalize);
-      state.localRows = St.listLocal();
-      state.loading = false;
-      $('refreshBtn').disabled = false;
-      renderDash();
-      renderAll();
-      clearErrorNotice();
-    }, function (err) {
-      state.loading = false;
-      $('refreshBtn').disabled = false;
-      var msg = rawOf(err);
-      // 只有「登录状态本身有问题」才退回登录页；表不存在、权限不足等要留在看板里说清楚
-      var sessionGone = msg === 'UNAUTH' || /JWT expired|Invalid Refresh Token|token is expired|invalid claim|登录已过期/i.test(msg);
-      if (BACKEND === 'supabase' && sessionGone) {
-        St.supabase.signOut();
-        renderLogin('登录状态已过期，请重新登录。');
-        return;
-      }
-      if (BACKEND === 'supabase') {
-        renderDash();
-        state.rows = [];
-        renderAll();
-        notice(explainDataError(err) + '　→ <a href="#" id="noticeDiag">运行诊断</a>', 'err');
-        var nd = $('noticeDiag');
-        if (nd) nd.onclick = function (e) { e.preventDefault(); runDiagnostics(); };
-      } else {
-        notice('读取数据失败：' + esc(msg), 'err');
-      }
-    });
-  }
-
-  function normalize(r) {
-    var o = Object.assign({}, r);
-    o.percents = o.percents || {};
-    o.scores = o.scores || {};
-    o.answer_detail = o.answer_detail || [];
-    if (!o.answer_detail.length && o.answers) {
-      Object.keys(o.answers).forEach(function (qid) {
-        var q = S.questions.filter(function (x) { return x.id === qid; })[0];
-        if (q && q.options[o.answers[qid]]) {
-          o.answer_detail.push({ id: qid, index: o.answers[qid], text: q.options[o.answers[qid]].text });
-        }
-      });
-    }
-    return o;
-  }
-
-  /* -------------------------------- 诊断 -------------------------------- */
-  /* 登录不上去的时候，把每一步都测一遍，告诉你到底卡在哪。 */
-
-  function shortJson(text) {
-    var s = String(text || '').replace(/\s+/g, ' ').trim();
-    return s.length > 180 ? s.slice(0, 180) + '…' : s;
-  }
-
-  /** 把 base64url 字符串解成本地信息（不用联网就能查 key 的毛病） */
-  function b64urlBytes(s) {
-    try {
-      var b = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
-      return b.length;
-    } catch (e) { return -1; }
-  }
-  function b64urlText(s) {
-    try {
-      return decodeURIComponent(escape(atob(String(s).replace(/-/g, '+').replace(/_/g, '/'))));
-    } catch (e) { return ''; }
-  }
-
-  /**
-   * 本地校验 anonKey 是否「长得对」。这一步不需要联网，
-   * 能立刻发现最常见的坑：复制时多/少字符、拿错项目的 key、把 service_role 放到前端、key 过期。
-   */
-  function inspectKey(key, projectUrl) {
-    var out = [];
-    if (!key) return [{ ok: false, title: 'anonKey 是空的', detail: '去 Project Settings → API Keys 复制 Project API key。' }];
-    if (/^sb_(publishable|secret)_/.test(key)) {
-      out.push({ ok: !/^sb_secret_/.test(key), title: '确认这是新版 API key 格式（sb_publishable_…）',
-        detail: /^sb_secret_/.test(key) ? '你填的是 sb_secret_ 开头的密钥，它权限等同于 service_role，绝对不能放在前端！请改用 sb_publishable_ 或 anon 公钥。' : '' });
-      return out;
-    }
-    if (key.slice(0, 3) !== 'eyJ') {
-      out.push({ ok: false, title: 'anonKey 看起来不是 Supabase 的 key（应以 eyJ… 或 sb_publishable_ 开头）',
-        detail: '你可能复制到了别的字段（比如 URL、JWT Secret 或数据库密码）。去 Project Settings → API Keys 重新复制。' });
-      return out;
-    }
-    var parts = key.split('.');
-    if (parts.length !== 3) {
-      out.push({ ok: false, title: 'anonKey 结构不对（JWT 应有 3 段，实际 ' + parts.length + ' 段）', detail: '重新完整复制一次。' });
-      return out;
-    }
-    var payload = null;
-    try { payload = JSON.parse(b64urlText(parts[1])) || null; } catch (e) { payload = null; }
-    var sigLen = b64urlBytes(parts[2]);
-    out.push({
-      ok: sigLen === 32,
-      title: 'anonKey 签名长度：' + sigLen + ' 字节（应为 32 字节 / 43 个字符，当前 ' + parts[2].length + ' 个字符）',
-      detail: sigLen === 32 ? 'Key 结构完整。'
-        : '❌ 这个 key 复制残缺了（多一个或少一个字符）。这正是「登录一直失败」最常见的原因：' +
-          'Supabase 会直接返回 401 Invalid API key。请回 Project Settings → API Keys 重新完整复制一次。'
-    });
-    if (!payload) {
-      out.push({ ok: false, title: 'anonKey 的内容解析不出来', detail: '重新完整复制。' });
-      return out;
-    }
-    out.push({ ok: payload.role !== 'service_role', title: 'key 的角色（role）= ' + (payload.role || '未知'),
-      detail: payload.role === 'service_role'
-        ? '这是 service_role key！它能绕过所有权限读到全部数据，绝对不能放在前端或仓库里。请换成 anon public / publishable key。'
-        : '' });
-    if (payload.exp) {
-      var expMs = payload.exp * 1000;
-      out.push({ ok: expMs > Date.now(), title: 'key 有效期至 ' + new Date(expMs).toLocaleString(),
-        detail: expMs > Date.now() ? '' : '这个 key 已过期，重新复制一个新的。' });
-    }
-    var m = /^https:\/\/([a-z0-9-]+)\.supabase\.(co|in)$/i.exec(String(projectUrl || '').replace(/\/+$/, ''));
-    if (m && payload.ref) {
-      out.push({ ok: m[1] === payload.ref, title: 'key 所属项目 ref = ' + payload.ref + '，URL 项目 = ' + m[1],
-        detail: m[1] === payload.ref ? '两者匹配。' : '❌ key 和 URL 不是同一个项目！把 URL 和 anonKey 都从同一个项目里重新复制一遍。' });
-    }
-    return out;
-  }
-
-  function renderDiag(lines, boxId) {
-    var el = $(boxId);
-    if (!el) return;
-    el.classList.remove('hidden');
-    var bad = lines.filter(function (l) { return l.ok === false; }).length;
-    el.innerHTML =
-      '<div class="diag-head">诊断结果：' + (bad ? '<b class="bad">发现 ' + bad + ' 个问题（红色项就是原因）</b>' : '<b class="ok">没有发现明显问题</b>') +
-      '　<button class="link-btn" id="diagCopy">复制诊断结果</button></div>' +
-      lines.map(function (l) {
-        var cls = l.ok === true ? 'ok' : (l.ok === false ? 'bad' : 'warn');
-        var ico = l.ok === true ? '✅' : (l.ok === false ? '❌' : '⚠️');
-        return '<div class="diag-line ' + cls + '"><span class="ico">' + ico + '</span><span class="txt"><b>' +
-          l.title + '</b>' + (l.detail ? '<br><span class="dt">' + l.detail + '</span>' : '') + '</span></div>';
-      }).join('');
-    var copy = $('diagCopy');
-    if (copy) {
-      copy.onclick = function () {
-        var text = lines.map(function (l) {
-          var ico = l.ok === true ? '[OK]' : (l.ok === false ? '[问题]' : '[提示]');
-          return ico + ' ' + l.title.replace(/<[^>]+>/g, '') + (l.detail ? ' — ' + l.detail.replace(/<[^>]+>/g, '') : '');
-        }).join('\n');
-        var ta = document.createElement('textarea');
-        ta.value = 'AI 人格测试后台诊断\n' + text + '\nUA: ' + navigator.userAgent;
-        document.body.appendChild(ta); ta.select();
-        try { document.execCommand('copy'); toast('诊断结果已复制，可直接发给开发者', 'ok'); } catch (e) { toast('复制失败', 'err'); }
-        document.body.removeChild(ta);
-      };
-    }
-  }
-
-  var diagBusy = false;
-  function runDiagnostics() {
-    if (diagBusy) return;
-    diagBusy = true;
-    var c = CFG.supabase || {};
-    var url = String(c.url || '').trim().replace(/\/+$/, '');
-    var key = String(c.anonKey || '').trim();
-    var table = c.table || 'ai_personality_responses';
-    var lines = [];
-    var inLogin = !$('viewLogin').classList.contains('hidden');
-    var boxId = inLogin ? 'diagBoxLogin' : 'diagBoxDash';
-    var otherBox = inLogin ? 'diagBoxDash' : 'diagBoxLogin';
-    if ($(otherBox)) $(otherBox).classList.add('hidden');
-    if ($(boxId)) { $(boxId).classList.remove('hidden'); $(boxId).innerHTML = '<div class="diag-head">正在诊断…</div>'; }
-
-    function push(ok, title, detail) { lines.push({ ok: ok, title: title, detail: detail || '' }); }
-    function jsonFetch(u, opt) {
-      return fetch(u, opt).then(function (res) {
-        return res.text().then(function (t) { return { status: res.status, text: t }; });
-      });
-    }
-
-    // --- 静态检查 ---
-    push(BACKEND === 'supabase', '后端模式 backend = ' + BACKEND,
-      BACKEND === 'supabase' ? '' : 'config.js 里 backend 不是 supabase（可能是没保存，或改了没重新上传到 GitHub Pages）。');
-    var urlOk = /^https:\/\/[a-z0-9-]+\.supabase\.(co|in)$/i.test(url);
-    var urlShape = /^https?:\/\/[^\s]+$/i.test(url);
-    push(urlOk ? true : (urlShape ? null : false), 'Project URL：' + (url || '（空）'),
-      urlOk ? '' : (urlShape
-        ? '不是标准的 https://项目id.supabase.co 形式。如果你用的是自建网关/本地测试可以忽略；否则请从 Project Settings → API → Project URL 重新复制（结尾不要带斜杠）。'
-        : '必须是 https:// 开头的完整地址，例如 https://abcdefgh.supabase.co'));
-
-    // anonKey 的离线体检（不联网就能查出「少复制一个字符」「拿错项目」「误用 service_role」）
-    inspectKey(key, url).forEach(function (l) { push(l.ok, l.title, l.detail); });
-    push(key.length > 100 && key.slice(0, 3) === 'eyJ', 'anonKey：' + (key ? '已填写，长度 ' + key.length : '（空）'),
-      (key.length > 100 && key.slice(0, 3) === 'eyJ') ? '' : 'anon public key 是一段很长的 eyJ… 字符串；不要把 service_role 或 JWT Secret 填进来。');
-    push(location.protocol !== 'file:', location.protocol === 'file:' ? '页面是用 file:// 打开的' : '页面地址：' + location.origin,
-      location.protocol === 'file:' ? 'file:// 下浏览器会拦截接口请求，请用本地服务器（npm run serve）或部署后的 https 网址打开。' : '');
-    var sess = St.supabase.session();
-    push(true, '后台登录状态：' + (sess && sess.email ? '已登录 ' + sess.email : '未登录'), '');
-
-    function done() {
-      diagBusy = false;
-      renderDiag(lines, boxId);
-      var bad = lines.filter(function (l) { return l.ok === false; }).length;
-      toast(bad ? '诊断完成：发现 ' + bad + ' 个问题（见下方红色项）' : '诊断完成：没发现明显问题', bad ? 'warn' : 'ok', 5000);
-    }
-
-    if (!url || !key) { done(); return; }
-
-    jsonFetch(url + '/rest/v1/', { headers: { apikey: key } })
-      .then(function (r) {
-        if (r.status === 200) { push(true, 'anonKey 有效（REST 接口可以访问）', ''); return true; }
-        if (r.status === 401) {
-          push(false, 'anonKey 被拒绝（HTTP 401：' + shortJson(r.text) + '）',
-            'Supabase 对 401 的说明是 "Invalid API key"。请回 Project Settings → API Keys 重新完整复制一次（注意别多复制或少复制字符）；' +
-            '如果项目已停用 legacy JWT key，请改用 sb_publishable_… 开头的新版密钥。');
-        } else {
-          push(false, 'REST 接口返回 HTTP ' + r.status, shortJson(r.text));
-        }
-        return false;
-      }, function (e) {
-        push(false, '连不上 ' + url, '网络错误：' + rawOf(e) + '。可能是 URL 写错、网络/代理拦截了 *.supabase.co，或 Supabase 免费项目被暂停（去控制台看是否需要 Restore）。');
-        return 'stop';
-      })
-      .then(function (keyOk) {
-        if (keyOk === 'stop') return null;
-        return jsonFetch(url + '/rest/v1/' + encodeURIComponent(table) + '?select=id&limit=1', { headers: { apikey: key } })
-          .then(function (r) {
-            var code = '';
-            try { code = (JSON.parse(r.text || '{}') || {}).code || ''; } catch (e) { code = ''; }
-            if (!keyOk) {
-              push(false, '数据表状态无法判断（anonKey 无效时所有请求都是 401）', '先把 anonKey 修好，再点一次「运行诊断」。');
-            } else if (code === 'PGRST205' || r.status === 404) {
-              push(false, '数据表 ' + table + ' 不存在', '打开 Supabase → SQL Editor → 把项目里的 supabase/schema.sql 全文粘贴 → Run。');
-            } else if (r.status === 401 || r.status === 403) {
-              push(true, '数据表存在，并且 RLS 生效（匿名读不到，这是正确的）', '');
-            } else if (r.status === 200) {
-              push(false, '⚠️ anon key 竟然能直接读表（RLS 没生效，别人也能看到答卷）', '重跑 supabase/schema.sql 里的 RLS 与策略部分（anon 只给 insert 权限）。');
-            } else {
-              push(false, '读取数据表返回 HTTP ' + r.status, shortJson(r.text));
-            }
-            return null;
-          }, function (e) { push(false, '读取数据表失败', rawOf(e)); });
-      }, function () { return null; })
-      .then(function () {
-        // 登录框里填了账号密码，就真跑一次登录，把 Supabase 的原始错误摊开
-        var em = ($('loginEmail') && $('loginEmail').value || '').trim();
-        var pw = ($('loginPwd') && $('loginPwd').value) || '';
-        if (!em || !pw) {
-          push(null, '没有填邮箱密码，跳过「账号密码」校验', '在表单里填上邮箱和密码，再点一次「运行诊断」，就能确认账号本身能不能登录。');
-          return null;
-        }
-        return jsonFetch(url + '/auth/v1/token?grant_type=password', {
-          method: 'POST',
-          headers: { apikey: key, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: em, password: pw })
-        }).then(function (r) {
-          if (r.status === 200) { push(true, '账号密码可以登录（' + em + '）', '如果这里通过但登录还是失败，请把后台页面强制刷新一次（Ctrl+F5）。'); return; }
-          var data = {};
-          try { data = JSON.parse(r.text || '{}') || {}; } catch (e) { data = {}; }
-          push(false, '登录被拒（HTTP ' + r.status + '）：' + shortJson(r.text),
-            explainAuthError({ message: data.error_description || data.message || data.error || r.text, status: r.status }));
-        });
-      }, function () { return null; })
-      .then(done, done);
-  }
-
-  /* ------------------------------- 筛选 ------------------------------- */
   function dayKey(d) {
-    var x = new Date(d);
-    if (isNaN(x.getTime())) return '';
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return x.getFullYear() + '-' + p(x.getMonth() + 1) + '-' + p(x.getDate());
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
   }
 
-  function rowsForView() {
-    if (!state.mergeLocal || BACKEND === 'local') return state.rows;
-    var seen = {};
-    var out = state.rows.slice();
-    out.forEach(function (r) { seen[r.id] = true; });
-    state.localRows.forEach(function (r) { if (!seen[r.id]) { seen[r.id] = true; out.push(normalize(r)); } });
-    out.sort(function (a, b) { return String(b.created_at).localeCompare(String(a.created_at)); });
-    return out;
+  function startOfToday() {
+    var d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
   }
 
-  function filtered() {
-    var now = new Date();
-    var start = null;
-    if (state.range === 'today') start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    else if (state.range === '7d') start = new Date(now.getTime() - 6 * 864e5);
-    else if (state.range === '30d') start = new Date(now.getTime() - 29 * 864e5);
-    else if (state.range === 'custom' && state.from) start = new Date(state.from + 'T00:00:00');
-    var end = (state.range === 'custom' && state.to) ? new Date(state.to + 'T23:59:59') : null;
+  function fmtTime(value) {
+    var d = toDate(value);
+    if (!d) return value ? String(value) : '—';
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+      ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
 
-    var kw = state.kw.trim().toLowerCase();
-    return rowsForView().filter(function (r) {
-      var d = new Date(r.created_at);
-      if (start && !(d >= start)) return false;
-      if (end && !(d <= end)) return false;
-      if (state.code && r.result_code !== state.code) return false;
-      if (kw) {
-        var hay = [r.nickname, r.result_name, r.result_code, r.user_agent, r.referrer, r.lang, r.screen]
-          .join(' ').toLowerCase();
-        if (hay.indexOf(kw) < 0) return false;
-      }
+  function fmtDuration(ms) {
+    var n = Number(ms);
+    if (!isFinite(n) || n <= 0) return '—';
+    var sec = n / 1000;
+    if (sec < 60) return (Math.round(sec * 10) / 10) + ' 秒';
+    var m = Math.floor(sec / 60);
+    var s = Math.round(sec % 60);
+    if (s === 60) { m += 1; s = 0; }
+    return m + ' 分 ' + s + ' 秒';
+  }
+
+  function fmtPct(part, total) {
+    if (!total) return 0;
+    return Math.round((part / total) * 100);
+  }
+
+  function fmtAvg(v) {
+    return (Math.round(v * 10) / 10).toFixed(1) + '%';
+  }
+
+  /* ============================== 记录字段解析 ============================== */
+
+  function isNewVersion(row) {
+    if (!row) return false;
+    if (row.survey_version === CURRENT_VERSION) return true;
+    // 极旧数据可能没有 survey_version，但 result_code 已是 M01-M08
+    var ver = row.survey_version;
+    if ((ver === undefined || ver === null || ver === '') && /^M0[1-8]$/.test(String(row.result_code || ''))) {
       return true;
+    }
+    return false;
+  }
+
+  function typeOf(row) {
+    if (!row || !E) return null;
+    var type = E.typeById && E.typeById(row.result_code);
+    if (type) return type;
+    var name = row.result_name;
+    if (!name) return null;
+    var types = E.types || [];
+    for (var i = 0; i < types.length; i++) {
+      if (types[i].name === name) return types[i];
+    }
+    return null;
+  }
+
+  function matchMeta(row) {
+    return (row && row.percents && row.percents.match) || null;
+  }
+
+  function isTie(row) {
+    var m = matchMeta(row);
+    if (!m) return false;
+    if (m.tie) return true;
+    return !!(m.candidates && m.candidates.length > 1);
+  }
+
+  function isAllNeutral(row) {
+    var m = matchMeta(row);
+    return !!(m && m.allNeutral);
+  }
+
+  function isNear(row) {
+    var m = matchMeta(row);
+    return !!(m && m.near && m.near.length);
+  }
+
+  function isComplete(row) {
+    var answered = Number(row && row.answered);
+    var total = Number(row && row.total);
+    return isFinite(answered) && isFinite(total) && total > 0 && answered >= total;
+  }
+
+  function durationOf(row) {
+    var n = Number(row && row.duration_ms);
+    return isFinite(n) && n > 0 ? n : 0;
+  }
+
+  /* ================================ 筛选 ================================ */
+
+  function matchVersion(row) {
+    if (state.filterVersion === 'new') return isNewVersion(row);
+    if (state.filterVersion === 'old') return !isNewVersion(row);
+    return true;
+  }
+
+  function matchRange(row) {
+    if (state.filterRange === 'all') return true;
+    var d = toDate(row && row.created_at);
+    if (!d) return false;
+    if (state.filterRange === 'today') return dayKey(d) === dayKey(new Date());
+    var days = state.filterRange === '7' ? 7 : 30;
+    var from = startOfToday();
+    from.setDate(from.getDate() - (days - 1));
+    return d.getTime() >= from.getTime();
+  }
+
+  function matchType(row) {
+    if (state.filterType) {
+      if (!isNewVersion(row)) return false;
+      var type = typeOf(row);
+      if (!type || type.id !== state.filterType) return false;
+    }
+    if (state.filterLegacy) {
+      if (isNewVersion(row)) return false;
+      if (String(row.result_code || '') !== state.filterLegacy) return false;
+    }
+    return true;
+  }
+
+  function sortDesc(rows) {
+    return (rows || []).slice().sort(function (a, b) {
+      return String(b && b.created_at || '').localeCompare(String(a && a.created_at || ''));
     });
   }
 
-  /* ------------------------------- 渲染 ------------------------------- */
+  function versionRows() { return state.rows.filter(matchVersion); }
+  function cohortRows() { return versionRows().filter(matchRange); }
+  function filteredRows() { return cohortRows().filter(matchType); }
 
-  function renderAll() {
-    var rows = filtered();
-    renderKpis(rows);
-    renderTypes(rows);
-    renderDims(rows);
-    renderTrend(rows);
-    renderQuestions(rows);
-    renderTable(rows);
-    renderCodeOptions();
+  /* ================================ 视图 ================================ */
+
+  function showView(name) {
+    els.viewLogin.hidden = name !== 'login';
+    els.viewDash.hidden = name !== 'dash';
+    try { document.body.setAttribute('data-view', name); } catch (e) { /* ignore */ }
+    try { window.scrollTo(0, 0); } catch (e) { /* ignore */ }
   }
+
+  function setLoginMessage(msg, kind) {
+    var node = els.loginMsg;
+    if (!node) return;
+    node.textContent = msg || '';
+    node.className = 'adm-login-msg' + (kind ? ' is-' + kind : '');
+  }
+
+  function setLoginBusy(busy) {
+    if (!els.loginBtn) return;
+    els.loginBtn.disabled = !!busy;
+    els.loginBtn.textContent = busy ? '登录中…' : '登录';
+  }
+
+  function setBusy(busy) {
+    if (els.refreshBtn) {
+      els.refreshBtn.disabled = !!busy;
+      els.refreshBtn.textContent = busy ? '读取中…' : '刷新';
+    }
+    if (els.viewDash) els.viewDash.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+
+  function showNotice(msg, kind, sticky) {
+    var node = els.notice;
+    if (!node) return;
+    if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
+    node.textContent = msg || '';
+    node.className = 'adm-notice' + (kind ? ' is-' + kind : '');
+    node.hidden = !msg;
+    if (msg && !sticky) {
+      noticeTimer = setTimeout(function () {
+        node.hidden = true;
+        node.textContent = '';
+      }, NOTICE_MS);
+    }
+  }
+
+  function clearNotice() {
+    if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
+    if (els.notice) {
+      els.notice.hidden = true;
+      els.notice.textContent = '';
+    }
+  }
+
+  /* ============================== 状态条渲染 ============================== */
+
+  function renderStatus() {
+    var sourceLabels = {
+      supabase: 'SUPABASE · 云端',
+      local: 'LOCAL · 本机浏览器',
+      custom: 'CUSTOM · 自定义接口'
+    };
+    if (els.statusSource) els.statusSource.textContent = sourceLabels[state.source] || state.source;
+    if (els.statusVersion) els.statusVersion.textContent = CURRENT_VERSION + ' · 8 机体';
+    if (els.statusEmail) {
+      els.statusEmail.textContent = state.email ||
+        (state.source === 'local' ? '未登录（本地模式）' : '未登录');
+    }
+    if (els.statusCount) {
+      if (!state.loaded && state.loading) {
+        els.statusCount.textContent = '读取中…';
+      } else if (state.rows.length) {
+        els.statusCount.textContent = state.rows.length + ' 条记录' +
+          (state.rows.length >= FETCH_LIMIT ? '（上限）' : '');
+      } else {
+        els.statusCount.textContent = state.loaded ? '0 条记录' : '—';
+      }
+    }
+  }
+
+  /* ================================ KPI ================================ */
+
+  var KPI_DEFS = [
+    { key: 'total', label: '总答卷', note: '当前版本 + 时间筛选' },
+    { key: 'today', label: '今日新增', note: '按本机日期统计' },
+    { key: 'newVersion', label: '新版答卷', note: 'survey_version = ' + CURRENT_VERSION },
+    { key: 'complete', label: '完成答卷率', note: 'answered = total' },
+    { key: 'duration', label: '平均用时', note: '含 duration_ms 的记录' },
+    { key: 'tie', label: '并列答卷数', note: 'percents.match.tie = true' }
+  ];
 
   function renderKpis(rows) {
-    var today = dayKey(new Date());
-    var todayCount = rows.filter(function (r) { return dayKey(r.created_at) === today; }).length;
-    var withDur = rows.filter(function (r) { return r.duration_ms > 0; });
-    var avg = withDur.length ? Math.round(withDur.reduce(function (a, r) { return a + r.duration_ms; }, 0) / withDur.length / 1000) : 0;
-    var codes = {};
-    rows.forEach(function (r) { codes[r.result_code] = (codes[r.result_code] || 0) + 1; });
-    var top = Object.keys(codes).sort(function (a, b) { return codes[b] - codes[a]; })[0];
-    var topType = top && E.TYPES[top] ? E.TYPES[top].name : '—';
-    var nick = rows.filter(function (r) { return r.nickname; }).length;
+    var todayKey = dayKey(new Date());
+    var today = 0, newVersion = 0, complete = 0, tie = 0;
+    var durSum = 0, durCount = 0;
 
-    var kpis = [
-      { v: rows.length, l: '筛选后作答数（总库 ' + rowsForView().length + ' 条）' },
-      { v: todayCount, l: '今天新增' },
-      { v: avg, l: '平均用时（秒）', small: 's' },
-      { v: top ? topType : '—', l: '最热人格类型' + (top ? '（' + top + '）' : ''), raw: true },
-      { v: nick, l: '填写了昵称的人数' }
-    ];
-    $('kpis').innerHTML = kpis.map(function (k) {
-      return '<div class="kpi"><div class="v">' + (k.raw ? esc(k.v) : k.v) +
-        (k.small ? '<small>' + k.small + '</small>' : '') + '</div><div class="l">' + esc(k.l) + '</div></div>';
-    }).join('');
+    rows.forEach(function (row) {
+      var d = toDate(row && row.created_at);
+      if (d && dayKey(d) === todayKey) today++;
+      if (isNewVersion(row)) newVersion++;
+      if (isComplete(row)) complete++;
+      if (isTie(row)) tie++;
+      var ms = durationOf(row);
+      if (ms) { durSum += ms; durCount++; }
+    });
+
+    var total = rows.length;
+    var values = {
+      total: String(total),
+      today: String(today),
+      newVersion: String(newVersion),
+      complete: total ? Math.round((complete / total) * 100) + '%' : '—',
+      duration: durCount ? fmtDuration(durSum / durCount) : '—',
+      tie: String(tie)
+    };
+
+    clear(els.kpis);
+    KPI_DEFS.forEach(function (def) {
+      var card = el('div', 'adm-kpi');
+      card.appendChild(el('span', 'adm-kpi-label mono', def.label));
+      card.appendChild(el('span', 'adm-kpi-value', values[def.key]));
+      card.appendChild(el('span', 'adm-kpi-note', def.note));
+      els.kpis.appendChild(card);
+    });
   }
 
-  function renderTypes(rows) {
+  /* ============================ 8 机体分布 ============================ */
+
+  function renderTypeChart(cohort) {
+    var types = (E && E.types) || [];
+    var newRows = cohort.filter(isNewVersion);
+    var totalNew = newRows.length;
     var counts = {};
-    rows.forEach(function (r) { counts[r.result_code] = (counts[r.result_code] || 0) + 1; });
-    var list = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; });
-    if (!list.length) { $('typeChart').innerHTML = '<p class="faint">暂无数据</p>'; return; }
-    var max = counts[list[0]];
-    $('typeChart').innerHTML = list.map(function (c, i) {
-      var t = E.TYPES[c] || { name: '未知', emoji: '❓' };
-      return '<div class="bar-row"><div class="bar-top">' +
-        '<span class="nm">' + t.emoji + ' ' + esc(t.name) + ' <span class="faint">' + esc(c) + '</span></span>' +
-        '<span class="vl">' + counts[c] + ' 人 · ' + pct(counts[c], rows.length) + '%</span></div>' +
-        '<div class="bar-track"><div class="bar-fill' + (i % 2 ? ' alt' : '') + '" style="width:' +
-        Math.max(2, Math.round((counts[c] / max) * 100)) + '%"></div></div></div>';
-    }).join('');
-  }
 
-  function renderDims(rows) {
-    var keys = Object.keys(S.dimensions);
-    var html = keys.map(function (k) {
-      var d = S.dimensions[k];
-      var left = 0, right = 0, sum = 0, n = 0;
-      rows.forEach(function (r) {
-        var p = (r.percents || {})[k];
-        if (!p || p.left === undefined) return;
-        n++;
-        sum += p.left;
-        if (p.pole === 'left') left++; else right++;
-      });
-      var lPct = pct(left, left + right);
-      var avgLeft = n ? Math.round(sum / n) : 50;
-      return '<div class="bar-row">' +
-        '<div class="bar-top"><span class="nm">' + esc(d.label) + '</span>' +
-        '<span class="vl">' + esc(d.left.name) + ' ' + lPct + '% · ' + esc(d.right.name) + ' ' + (100 - lPct) + '%（平均倾向 ' + avgLeft + ' 分）</span></div>' +
-        '<div class="split-bar"><div class="l" style="width:' + lPct + '%"></div><div class="r" style="width:' + (100 - lPct) + '%"></div></div>' +
-        '</div>';
-    }).join('');
-    $('dimChart').innerHTML = rows.length ? html : '<p class="faint">暂无数据</p>';
-  }
+    newRows.forEach(function (row) {
+      var type = typeOf(row);
+      if (type) counts[type.id] = (counts[type.id] || 0) + 1;
+    });
 
-  function renderTrend(rows) {
-    var days = [];
-    var today = new Date();
-    for (var i = 13; i >= 0; i--) {
-      var d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
-      days.push({ key: dayKey(d), label: (d.getMonth() + 1) + '/' + d.getDate(), n: 0 });
+    clear(els.typeChart);
+    types.forEach(function (type) {
+      var n = counts[type.id] || 0;
+      var pct = fmtPct(n, totalNew);
+      var row = el('button', 'adm-dist-row');
+      row.type = 'button';
+      row.setAttribute('data-code', type.id);
+      row.setAttribute('aria-pressed', state.filterType === type.id ? 'true' : 'false');
+      if (state.filterType === type.id) row.classList.add('is-active');
+
+      var name = el('span', 'adm-dist-name');
+      name.appendChild(el('span', 'adm-dist-name-text', type.name));
+      name.appendChild(el('span', 'adm-dist-code mono', type.id));
+      row.appendChild(name);
+
+      var bar = el('span', 'adm-dist-bar');
+      var fill = el('span', 'adm-dist-fill');
+      fill.style.width = pct + '%';
+      bar.appendChild(fill);
+      row.appendChild(bar);
+
+      var val = el('span', 'adm-dist-val');
+      val.appendChild(el('b', null, String(n)));
+      val.appendChild(el('i', null, ' · ' + pct + '%'));
+      row.appendChild(val);
+
+      row.title = type.name + '：' + n + ' 份（' + pct + '%），点击筛选下方表格';
+      els.typeChart.appendChild(row);
+    });
+
+    if (!totalNew) {
+      els.typeChart.appendChild(el('p', 'adm-empty', '当前筛选范围内没有新版答卷。'));
     }
-    var idx = {};
-    days.forEach(function (d) { idx[d.key] = d; });
-    rows.forEach(function (r) {
-      var k = dayKey(r.created_at);
-      if (idx[k]) idx[k].n++;
-    });
-    var max = Math.max.apply(null, days.map(function (d) { return d.n; }).concat([1]));
-    $('trendChart').innerHTML = days.map(function (d) {
-      var h = Math.round((d.n / max) * 78);
-      return '<div class="col" title="' + d.key + '：' + d.n + ' 人">' +
-        '<i style="height:' + Math.max(2, h) + 'px"></i><span>' + d.label + '</span></div>';
-    }).join('');
+
+    if (els.typeMeta) {
+      var loadedNew = state.rows.filter(isNewVersion).length;
+      var loadedOld = state.rows.length - loadedNew;
+      var meta;
+      if (state.filterVersion === 'new') {
+        meta = totalNew + ' 份新版' + (loadedOld ? ' · 已隐藏 ' + loadedOld + ' 份旧版' : '');
+      } else if (state.filterVersion === 'old') {
+        meta = cohort.length + ' 份旧版' + (loadedNew ? ' · 已隐藏 ' + loadedNew + ' 份新版' : '');
+      } else {
+        meta = totalNew + ' 份新版 / ' + (cohort.length - totalNew) + ' 份旧版';
+      }
+      els.typeMeta.textContent = meta;
+    }
+
+    renderLegacyChart(cohort);
   }
 
-  function renderQuestions(rows) {
-    var html = S.questions.map(function (q) {
-      var counts = q.options.map(function () { return 0; });
-      var total = 0;
-      rows.forEach(function (r) {
-        var picked = null;
-        (r.answer_detail || []).forEach(function (d) { if (d.id === q.id) picked = Number(d.index); });
-        if (picked === null && r.answers && r.answers[q.id] !== undefined) picked = Number(r.answers[q.id]);
-        if (picked === null || isNaN(picked) || picked < 0 || picked >= counts.length) return;
-        counts[picked]++; total++;
+  function renderLegacyChart(cohort) {
+    if (!els.legacyBlock || !els.legacyChart) return;
+    var visible = state.filterVersion !== 'new';
+    els.legacyBlock.hidden = !visible;
+    if (!visible) return;
+
+    clear(els.legacyChart);
+    var oldRows = cohort.filter(function (row) { return !isNewVersion(row); });
+    if (!oldRows.length) {
+      els.legacyChart.appendChild(el('p', 'adm-empty',
+        '当前数据范围内没有旧版记录（后台只读取最近 ' + FETCH_LIMIT + ' 条）。'));
+      return;
+    }
+
+    var groups = {};
+    var order = [];
+    oldRows.forEach(function (row) {
+      var code = String(row.result_code || '').trim() || '（无编号）';
+      if (!groups[code]) {
+        groups[code] = { code: code, name: row.result_name ? String(row.result_name) : '', count: 0 };
+        order.push(code);
+      }
+      groups[code].count++;
+      if (!groups[code].name && row.result_name) groups[code].name = String(row.result_name);
+    });
+
+    order.sort(function (a, b) { return groups[b].count - groups[a].count; });
+    var totalOld = oldRows.length;
+
+    order.forEach(function (code) {
+      var group = groups[code];
+      var pct = fmtPct(group.count, totalOld);
+      var row = el('button', 'adm-dist-row');
+      row.type = 'button';
+      row.setAttribute('data-legacy', code);
+      row.setAttribute('aria-pressed', state.filterLegacy === code ? 'true' : 'false');
+      if (state.filterLegacy === code) row.classList.add('is-active');
+
+      var name = el('span', 'adm-dist-name');
+      name.appendChild(el('span', 'adm-dist-legacy-code mono', code));
+      if (group.name) name.appendChild(el('span', 'adm-dist-code', group.name));
+      row.appendChild(name);
+
+      var bar = el('span', 'adm-dist-bar');
+      var fill = el('span', 'adm-dist-fill');
+      fill.style.width = pct + '%';
+      bar.appendChild(fill);
+      row.appendChild(bar);
+
+      var val = el('span', 'adm-dist-val');
+      val.appendChild(el('b', null, String(group.count)));
+      val.appendChild(el('i', null, ' · ' + pct + '%'));
+      row.appendChild(val);
+
+      row.title = '旧版类型 ' + code + '：' + group.count + ' 份，点击筛选下方表格';
+      els.legacyChart.appendChild(row);
+    });
+  }
+
+  /* ============================== 四维平均 ============================== */
+
+  function renderDimChart(cohort) {
+    clear(els.dimChart);
+    var newRows = cohort.filter(isNewVersion);
+
+    DIM_ORDER.forEach(function (key) {
+      var dim = DIMS[key];
+      if (!dim) return;
+      var leftName = (dim.left && dim.left.name) || '左侧';
+      var rightName = (dim.right && dim.right.name) || '右侧';
+      var sum = 0;
+      var n = 0;
+
+      newRows.forEach(function (row) {
+        var p = row.percents && row.percents[key];
+        var v = p ? Number(p.left) : NaN;
+        if (isFinite(v)) { sum += v; n++; }
       });
-      if (!total) return '';
-      var max = Math.max.apply(null, counts);
-      var bars = q.options.map(function (o, i) {
-        return '<div class="bar-row"><div class="bar-top"><span class="nm">' + esc(o.text) + '</span>' +
-          '<span class="vl">' + counts[i] + ' 人 · ' + pct(counts[i], total) + '%</span></div>' +
-          '<div class="bar-track"><div class="bar-fill" style="width:' + Math.max(2, Math.round((counts[i] / max) * 100)) + '%"></div></div></div>';
-      }).join('');
-      return '<div class="q-block"><div class="qt"><b>' + esc(q.id.toUpperCase()) + '</b>' + esc(q.text) +
-        ' <span class="faint">（有效作答 ' + total + '）</span></div>' + bars + '</div>';
-    }).join('');
-    $('questionStats').innerHTML = html || '<p class="faint">暂无数据</p>';
+
+      var avg = n ? sum / n : null;
+
+      var wrap = el('div', 'adm-dim');
+      var head = el('div', 'adm-dim-head');
+      head.appendChild(el('span', 'adm-dim-label', dim.label || key));
+      head.appendChild(el('span', 'adm-dim-n mono', n ? 'n=' + n : '无有效样本'));
+      wrap.appendChild(head);
+
+      var body = el('div', 'adm-dim-body');
+      body.appendChild(el('span', 'adm-dim-pole', leftName));
+
+      var track = el('div', 'adm-dim-track');
+      var fill = el('span', 'adm-dim-fill');
+      fill.style.width = (avg === null ? 0 : Math.max(0, Math.min(100, avg))) + '%';
+      track.appendChild(fill);
+      track.appendChild(el('span', 'adm-dim-mid'));
+      track.title = avg === null
+        ? (dim.label || key) + '：暂无新版数据'
+        : (dim.label || key) + '：' + leftName + ' ' + fmtAvg(avg) + ' / ' +
+          rightName + ' ' + fmtAvg(100 - avg);
+      body.appendChild(track);
+
+      body.appendChild(el('span', 'adm-dim-pole adm-dim-pole--right', rightName));
+      wrap.appendChild(body);
+
+      var foot = el('div', 'adm-dim-foot');
+      foot.appendChild(el('span', 'mono adm-dim-val-l',
+        avg === null ? '左侧平均 —' : '左侧平均 ' + fmtAvg(avg)));
+      foot.appendChild(el('span', 'mono adm-dim-val-r',
+        avg === null ? '右侧平均 —' : '右侧平均 ' + fmtAvg(100 - avg)));
+      wrap.appendChild(foot);
+
+      els.dimChart.appendChild(wrap);
+    });
   }
 
-  function renderCodeOptions() {
-    var sel = $('filterCode');
-    var counts = {};
-    rowsForView().forEach(function (r) { counts[r.result_code] = (counts[r.result_code] || 0) + 1; });
-    var cur = state.code;
-    var opts = ['<option value="">全部类型</option>'];
-    Object.keys(counts).sort().forEach(function (c) {
-      var t = E.TYPES[c];
-      opts.push('<option value="' + esc(c) + '"' + (cur === c ? ' selected' : '') + '>' +
-        esc(c + ' ' + (t ? t.name : '')) + '（' + counts[c] + '）</option>');
+  /* ============================ 16 题选项分布 ============================ */
+
+  function renderQuestionStats(cohort) {
+    var questions = S.questions || [];
+    var answeredRows = cohort.filter(function (row) {
+      return row && row.answers && typeof row.answers === 'object';
     });
-    sel.innerHTML = opts.join('');
+
+    clear(els.questionStats);
+
+    questions.forEach(function (question) {
+      var counts = [0, 0, 0];
+      var valid = 0;
+
+      answeredRows.forEach(function (row) {
+        var raw = row.answers ? row.answers[question.id] : undefined;
+        var idx = Number(raw);
+        if (isFinite(idx) && Math.floor(idx) === idx && idx >= 0 && idx < counts.length) {
+          counts[idx]++;
+          valid++;
+        }
+      });
+
+      var block = el('div', 'adm-q');
+
+      var head = el('div', 'adm-q-head');
+      head.appendChild(el('span', 'adm-q-id', String(question.id || '').toUpperCase()));
+      var dim = DIMS[question.dim];
+      head.appendChild(el('span', 'adm-q-dim', (dim && dim.label) || question.dim || ''));
+      block.appendChild(head);
+
+      block.appendChild(el('p', 'adm-q-text', question.text || ''));
+
+      (question.options || []).forEach(function (opt, index) {
+        var n = counts[index] || 0;
+        var pct = fmtPct(n, valid);
+        var row = el('div', 'adm-opt');
+
+        var text = el('span', 'adm-opt-text', opt.text || '');
+        text.title = opt.text || '';
+        row.appendChild(text);
+
+        var track = el('span', 'adm-opt-track');
+        var fill = el('span', 'adm-opt-fill');
+        fill.style.width = pct + '%';
+        track.appendChild(fill);
+        row.appendChild(track);
+
+        row.appendChild(el('span', 'adm-opt-val', n + ' · ' + pct + '%'));
+        block.appendChild(row);
+      });
+
+      els.questionStats.appendChild(block);
+    });
+
+    if (els.questionMeta) {
+      els.questionMeta.textContent = 'OPTION STATS · ' + cohort.length + ' 份';
+    }
+  }
+
+  /* ============================== 14 天趋势 ============================== */
+
+  function renderTrend() {
+    var chart = els.trendChart;
+    if (!chart) return;
+    clear(chart);
+
+    var days = [];
+    var today = startOfToday();
+    for (var i = 13; i >= 0; i--) {
+      var d = new Date(today.getTime());
+      d.setDate(d.getDate() - i);
+      days.push({ key: dayKey(d), month: d.getMonth() + 1, day: d.getDate(), count: 0 });
+    }
+
+    var byKey = {};
+    days.forEach(function (item) { byKey[item.key] = item; });
+
+    // 趋势不受“时间范围”筛选影响，只看版本与机体筛选
+    versionRows().filter(matchType).forEach(function (row) {
+      var d = toDate(row && row.created_at);
+      if (!d) return;
+      var item = byKey[dayKey(d)];
+      if (item) item.count++;
+    });
+
+    var max = 1;
+    days.forEach(function (item) { if (item.count > max) max = item.count; });
+    var total = 0;
+
+    days.forEach(function (item, index) {
+      total += item.count;
+      var isToday = index === days.length - 1;
+      var col = el('div', 'adm-trend-col' + (item.count ? '' : ' is-zero') +
+        (isToday ? ' is-today' : ''));
+      col.title = item.key + '：' + item.count + ' 条';
+
+      col.appendChild(el('span', 'adm-trend-count', String(item.count)));
+
+      var barWrap = el('div', 'adm-trend-barwrap');
+      var bar = el('span', 'adm-trend-bar');
+      bar.style.height = item.count
+        ? Math.max(3, Math.round((item.count / max) * 104)) + 'px'
+        : '2px';
+      barWrap.appendChild(bar);
+      col.appendChild(barWrap);
+
+      col.appendChild(el('span', 'adm-trend-date', item.month + '/' + item.day));
+      chart.appendChild(col);
+    });
+
+    if (els.trendNote) {
+      var tone = state.filterVersion === 'old' ? '当前为旧版视图' : '当前为新版视图';
+      els.trendNote.textContent = '统计口径：按本机日期归档，最近 14 天共 ' + total +
+        ' 条；不受“时间范围”筛选影响（' + tone + '）。';
+    }
+  }
+
+  /* ================================ 表格 ================================ */
+
+  function buildRow(row) {
+    var tr = el('tr');
+    tr.setAttribute('data-id', String(row.id || ''));
+
+    var time = el('td', 'adm-cell-time');
+    time.textContent = fmtTime(row.created_at);
+    var created = toDate(row.created_at);
+    if (created) time.title = created.toISOString();
+    tr.appendChild(time);
+
+    var version = el('td');
+    var versionBadge = el('span', 'adm-ver mono', row.survey_version || '—');
+    if (isNewVersion(row)) versionBadge.classList.add('is-current');
+    version.appendChild(versionBadge);
+    tr.appendChild(version);
+
+    var result = el('td', 'adm-cell-result');
+    if (isNewVersion(row)) {
+      var type = typeOf(row);
+      result.appendChild(el('span', 'adm-result-name',
+        (type && type.name) || row.result_name || '未知机体'));
+      result.appendChild(el('span', 'adm-result-code mono',
+        (type && type.id) || row.result_code || ''));
+    } else {
+      result.appendChild(el('span', 'adm-result-legacy mono', row.result_code || '（无编号）'));
+      if (row.result_name) {
+        result.appendChild(el('span', 'adm-result-oldname', String(row.result_name)));
+      }
+    }
+    tr.appendChild(result);
+
+    var nick = el('td', 'adm-cell-nick');
+    nick.textContent = row.nickname ? String(row.nickname) : '—';
+    if (row.nickname) nick.title = String(row.nickname);
+    tr.appendChild(nick);
+
+    var duration = el('td', 'adm-cell-dur');
+    duration.textContent = fmtDuration(durationOf(row));
+    tr.appendChild(duration);
+
+    var flags = el('td', 'adm-cell-flags');
+    if (isTie(row)) flags.appendChild(el('span', 'adm-flag adm-flag--tie', '并列'));
+    if (isAllNeutral(row)) flags.appendChild(el('span', 'adm-flag adm-flag--neutral', '全中性'));
+    if (!isTie(row) && isNear(row)) flags.appendChild(el('span', 'adm-flag', '近似'));
+    if (!flags.firstChild) flags.appendChild(el('span', 'adm-cell-note', '—'));
+    tr.appendChild(flags);
+
+    var device = el('td', 'adm-device');
+    device.appendChild(el('span', 'adm-device-main', row.screen || '—'));
+    if (row.lang) device.appendChild(el('span', 'adm-device-sub mono', String(row.lang)));
+    if (row.user_agent) device.title = String(row.user_agent);
+    tr.appendChild(device);
+
+    var ops = el('td', 'adm-cell-ops');
+    var view = el('button', 'adm-btn-view', '查看');
+    view.type = 'button';
+    view.setAttribute('data-view', String(row.id || ''));
+    view.title = '查看这份答卷的逐题答案';
+    ops.appendChild(view);
+    var del = el('button', 'adm-btn-del', '删除');
+    del.type = 'button';
+    del.setAttribute('data-del', String(row.id || ''));
+    ops.appendChild(del);
+    tr.appendChild(ops);
+
+    return tr;
   }
 
   function renderTable(rows) {
-    var start = (state.page - 1) * state.pageSize;
-    var pageRows = rows.slice(start, start + state.pageSize);
-    var pages = Math.max(1, Math.ceil(rows.length / state.pageSize));
-    if (state.page > pages) { state.page = pages; start = (state.page - 1) * state.pageSize; pageRows = rows.slice(start, start + state.pageSize); }
+    var tbody = els.tableBody;
+    if (!tbody) return;
+    clear(tbody);
 
-    $('tableInfo').textContent = rows.length
-      ? '共 ' + rows.length + ' 条 · 第 ' + state.page + '/' + pages + ' 页'
-      : '没有符合条件的数据';
+    var list = rows.slice(0, TABLE_LIMIT);
+    if (els.tableInfo) {
+      els.tableInfo.textContent = rows.length + ' 条筛选结果 · 显示 ' + list.length +
+        (rows.length > list.length ? ' 行（上限 ' + TABLE_LIMIT + '）' : ' 行');
+    }
 
-    if (!rows.length) {
-      $('tableBody').innerHTML = '';
-      $('pager').innerHTML = '';
+    if (!list.length) {
+      var tr = el('tr', 'adm-table-empty');
+      var td = el('td');
+      td.colSpan = 8;
+      td.textContent = state.rows.length
+        ? '当前筛选条件下没有记录，调整版本 / 时间 / 机体筛选试试。'
+        : (state.loaded ? '暂无数据。' : '正在读取数据…');
+      tr.appendChild(td);
+      tbody.appendChild(tr);
       return;
     }
 
-    $('tableBody').innerHTML = pageRows.map(function (r) {
-      var t = E.TYPES[r.result_code] || { name: r.result_name || '未知', emoji: '❓' };
-      var dims = Object.keys(S.dimensions).map(function (k) {
-        var p = (r.percents || {})[k];
-        if (!p) return '';
-        var poleName = p.pole === 'left' ? p.leftName : p.rightName;
-        var poleVal = p.pole === 'left' ? p.left : p.right;
-        return '<span class="pill" style="margin:2px 4px 2px 0">' + esc(S.dimensions[k].label) + '：' + esc(poleName) + ' ' + poleVal + '%</span>';
-      }).join('');
-      var detailRows = (r.answer_detail || []).map(function (d) {
-        var q = S.questions.filter(function (x) { return x.id === d.id; })[0];
-        return '<dt>' + esc(d.id.toUpperCase()) + ' ' + esc(q ? q.text : '') + '</dt><dd>' + esc(d.text) + '</dd>';
-      }).join('');
-      var meta = [
-        ['昵称', r.nickname || '（未填）'],
-        ['用时', r.duration_ms ? (r.duration_ms / 1000).toFixed(1) + ' 秒' : '—'],
-        ['完成题数', (r.answered || '?') + '/' + (r.total || S.questions.length)],
-        ['问卷版本', r.survey_version || '—'],
-        ['设备', r.user_agent || '—'],
-        ['来源页', r.referrer || '直接打开'],
-        ['语言 / 屏幕', (r.lang || '—') + ' / ' + (r.screen || '—')],
-        ['时区', r.timezone || '—'],
-        ['记录 ID', r.id]
-      ].map(function (kv) { return '<dt>' + esc(kv[0]) + '</dt><dd>' + esc(kv[1]) + '</dd>'; }).join('');
+    list.forEach(function (row) { tbody.appendChild(buildRow(row)); });
+  }
 
-      var open = !!state.expanded[r.id];
-      return '<tr data-id="' + esc(r.id) + '">' +
-        '<td class="mono">' + esc(St.localTime(r.created_at)) + '</td>' +
-        '<td><span class="pill">' + esc(r.result_code) + '</span><br>' + t.emoji + ' ' + esc(t.name) + '</td>' +
-        '<td>' + esc(r.nickname || '—') + '</td>' +
-        '<td class="mono">' + (r.duration_ms ? Math.round(r.duration_ms / 1000) + 's' : '—') + '</td>' +
-        '<td>' + dims + '</td>' +
-        '<td class="mono"><button class="link-btn" data-act="toggle">' + (open ? '收起' : '详情') + '</button>' +
-        '<button class="link-btn danger" data-act="del">删除</button></td>' +
-        '</tr>' +
-        (open ? '<tr><td colspan="6" class="detail-cell"><dl>' + meta + detailRows + '</dl></td></tr>' : '');
-    }).join('');
+  /* ============================== 全部渲染 ============================== */
 
-    $('pager').innerHTML =
-      '<button class="btn btn-ghost" id="prevPage"' + (state.page <= 1 ? ' disabled' : '') + '>← 上一页</button>' +
-      '<button class="btn btn-ghost" id="nextPage"' + (state.page >= pages ? ' disabled' : '') + '>下一页 →</button>';
+  function renderAll() {
+    var cohort = cohortRows();
+    renderStatus();
+    renderKpis(cohort);
+    renderTypeChart(cohort);
+    renderDimChart(cohort);
+    renderQuestionStats(cohort);
+    renderTrend();
+    renderTable(cohort.filter(matchType));
+  }
 
-    $('prevPage').onclick = function () { if (state.page > 1) { state.page--; renderTable(filtered()); } };
-    $('nextPage').onclick = function () { if (state.page < pages) { state.page++; renderTable(filtered()); } };
-    $('tableBody').onclick = function (e) {
-      var btn = e.target.closest('button[data-act]');
-      if (!btn) return;
-      var tr = e.target.closest('tr');
-      var id = tr.getAttribute('data-id');
-      var act = btn.getAttribute('data-act');
-      if (act === 'toggle') {
-        state.expanded[id] = !state.expanded[id];
-        renderTable(filtered());
-      } else if (act === 'del') {
-        if (!confirm('确定删除这条记录？删除后无法恢复。')) return;
-        St.admin.remove(id).then(function () {
-          toast('已删除', 'ok');
-          state.rows = state.rows.filter(function (r) { return r.id !== id; });
-          St.deleteLocal(id);
-          renderAll();
-        }, function (err) { toast('删除失败：' + ((err && err.message) || ''), 'err'); });
+  /* ============================== 数据加载 ============================== */
+
+  function load(opts) {
+    opts = opts || {};
+    if (state.loading) return;
+    if (!St || !St.admin || typeof St.admin.fetchRows !== 'function') {
+      showNotice('数据层没有就绪：Store.admin.fetchRows 缺失，请检查 store.js 是否加载。', 'error', true);
+      return;
+    }
+
+    state.loading = true;
+    setBusy(true);
+    clearNotice();
+    renderStatus();
+
+    if (els.tableInfo) els.tableInfo.textContent = '读取中…';
+
+    var request;
+    try {
+      request = St.admin.fetchRows({ limit: FETCH_LIMIT });
+    } catch (err) {
+      state.loading = false;
+      setBusy(false);
+      renderAll();
+      handleLoadError(err);
+      return;
+    }
+
+    request.then(function (rows) {
+      state.rows = sortDesc(Array.isArray(rows) ? rows : []);
+      state.loading = false;
+      state.loaded = true;
+      setBusy(false);
+      renderAll();
+      if (opts.successMsg) showNotice(opts.successMsg, 'success', false);
+    }, function (err) {
+      state.loading = false;
+      state.loaded = true;
+      setBusy(false);
+      if (isExpiredAuth(err)) {
+        forceRelogin(messageOf(err));
+        return;
       }
-    };
+      renderAll();
+      handleLoadError(err);
+    });
   }
 
-  /* ------------------------------- 导出 ------------------------------- */
+  /* ============================== 错误处理 ============================== */
 
-  function download(filename, text, mime) {
-    var blob = new Blob([text], { type: mime || 'text/plain;charset=utf-8' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  function isExpiredAuth(err) {
+    var msg = messageOf(err);
+    if (err && err.status === 401) return true;
+    if (err && err.code === 'UNAUTH') {
+      // Store 把 403 也标成 UNAUTH，但权限问题不应把用户踢回登录页
+      if (/权限|permission|rls|policy|row-level/i.test(msg)) return false;
+      return true;
+    }
+    if (/登录已过期|重新登录|jwt|token/i.test(msg) && !/权限|permission|rls/i.test(msg)) {
+      return true;
+    }
+    return false;
   }
 
-  function stamp() {
-    var d = new Date();
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
+  function forceRelogin(msg) {
+    try { St.admin.signOut(); } catch (e) { /* ignore */ }
+    state.email = '';
+    showView('login');
+    setLoginMessage(msg || '登录已过期，请重新登录。', 'error');
   }
 
-  /* -------------------------------- 启动 -------------------------------- */
-
-  function wireFilters() {
-    $('filterRange').onchange = function () {
-      state.range = this.value;
-      $('customRange').classList.toggle('hidden', state.range !== 'custom');
-      state.page = 1; renderAll();
-    };
-    $('filterFrom').onchange = function () { state.from = this.value; state.page = 1; renderAll(); };
-    $('filterTo').onchange = function () { state.to = this.value; state.page = 1; renderAll(); };
-    $('filterCode').onchange = function () { state.code = this.value; state.page = 1; renderAll(); };
-    var kwTimer = null;
-    $('filterKw').oninput = function () {
-      var v = this.value;
-      clearTimeout(kwTimer);
-      kwTimer = setTimeout(function () { state.kw = v; state.page = 1; renderAll(); }, 220);
-    };
-    $('mergeLocal').onchange = function () { state.mergeLocal = this.checked; state.page = 1; renderAll(); };
-    $('refreshBtn').onclick = function () { load(); };
-
-    $('exportCsv').onclick = function () {
-      var rows = filtered();
-      if (!rows.length) return toast('当前没有可导出的数据', 'warn');
-      download('ai-personality-' + stamp() + '.csv', St.toCSV(rows, S), 'text/csv;charset=utf-8');
-      toast('已导出 ' + rows.length + ' 条 CSV', 'ok');
-    };
-    $('exportJson').onclick = function () {
-      var rows = filtered();
-      if (!rows.length) return toast('当前没有可导出的数据', 'warn');
-      download('ai-personality-' + stamp() + '.json', JSON.stringify(rows, null, 2), 'application/json');
-      toast('已导出 ' + rows.length + ' 条 JSON', 'ok');
-    };
-    $('importJson').onclick = function () { $('importFile').click(); };
-    $('importFile').onchange = function () {
-      var f = this.files && this.files[0];
-      if (!f) return;
-      var reader = new FileReader();
-      reader.onload = function () {
-        try {
-          var data = JSON.parse(String(reader.result));
-          var rows = Array.isArray(data) ? data : (data.rows || data.data || []);
-          var n = St.importRows(rows);
-          toast('已导入 ' + n + ' 条到本地视图', 'ok');
-          state.mergeLocal = true;
-          $('mergeLocal').checked = true;
-          state.localRows = St.listLocal();
-          renderAll();
-        } catch (e) { toast('文件解析失败：' + e.message, 'err'); }
-      };
-      reader.readAsText(f);
-      this.value = '';
-    };
-    $('logoutBtn').onclick = function () {
-      St.supabase.signOut();
-      renderLogin();
-    };
+  function handleLoadError(err) {
+    var msg = messageOf(err);
+    var hint;
+    if (/权限|permission|rls|policy|row-level/i.test(msg)) {
+      hint = '请到 Supabase 检查 RLS 策略：authenticated 角色需要有表 ai_personality_responses 的 select 权限（auth_can_read）；修复后请重新登录并刷新页面。';
+    } else if (/不存在|does not exist|not exist|relation|schema|could not find|找不到/i.test(msg)) {
+      hint = '请到 Supabase → Table Editor 确认表 ai_personality_responses 存在，并核对 config.js 里的 supabase.table。';
+    } else if (/network|failed to fetch|连不上|timeout|超时|abort/i.test(msg)) {
+      hint = '请检查网络连接后点击“刷新”重试。';
+    } else {
+      hint = '可到 Supabase 控制台检查数据表与 RLS 配置后点击“刷新”重试。';
+    }
+    showNotice('读取失败：' + msg + '。' + hint, 'error', true);
   }
 
-  function wireLogin() {
-    var form = $('loginForm');
-    form.onsubmit = function (e) {
-      e.preventDefault();
-      var email = $('loginEmail').value.trim();
-      var pwd = $('loginPwd').value;
-      if (!email || !pwd) return;
-      $('loginBtn').disabled = true;
-      $('loginBtn').textContent = '登录中…';
-      St.supabase.signIn(email, pwd).then(function (s) {
-        $('loginBtn').disabled = false;
-        $('loginBtn').textContent = '登录';
-        $('userEmail').textContent = s.email;
-        renderDash();
-        load();
-      }, function (err) {
-        $('loginBtn').disabled = false;
-        $('loginBtn').textContent = '登录';
-        renderLogin(esc(explainAuthError(err)), rawOf(err));
-      });
-    };
-    var diagBtn = $('diagBtnLogin');
-    if (diagBtn) diagBtn.onclick = function () { runDiagnostics(); };
-    var diagBtnDash = $('diagBtnDash');
-    if (diagBtnDash) diagBtnDash.onclick = function () { runDiagnostics(); };
+  function handleRemoveError(err) {
+    if (isExpiredAuth(err)) {
+      forceRelogin(messageOf(err));
+      return;
+    }
+    var msg = messageOf(err);
+    var hint = /权限|permission|rls|policy|row-level/i.test(msg)
+      ? '请到 Supabase 检查 auth_can_delete 策略是否允许 authenticated 删除。'
+      : '请稍后重试，或到 Supabase 控制台手动删除。';
+    showNotice('删除失败：' + msg + '。' + hint, 'error', true);
   }
 
-  function boot() {
-    document.title = (CFG.admin && CFG.admin.title) || '数据后台';
-    $('adminTitle').textContent = (CFG.admin && CFG.admin.title) || '数据后台';
-    wireFilters();
-    wireLogin();
+  /* ================================ 登录 ================================ */
 
-    var modeText = BACKEND === 'supabase' ? 'Supabase 云端数据库' : (BACKEND === 'custom' ? '自定义接口' : '本地模式（local）');
-    $('modeChip').textContent = '数据源：' + modeText;
-    $('logoutBtn').classList.toggle('hidden', BACKEND !== 'supabase');
-    $('userEmail').textContent = (St.supabase.session() || {}).email || '';
+  function onLoginSubmit(event) {
+    if (event && event.preventDefault) event.preventDefault();
+    if (state.loading) return;
+    if (!St || !St.admin || typeof St.admin.signIn !== 'function') {
+      setLoginMessage('数据层没有就绪：Store.admin.signIn 缺失。', 'error');
+      return;
+    }
 
-    if (BACKEND === 'local') {
-      notice('当前 <code>config.js</code> 里的 <code>backend</code> 是 <b>local</b>：这里只能看到「本机浏览器」里存下的作答记录（包括你自己测试的那几次）。' +
-        '想让所有访客的数据都汇总到这里，请按 README 把 backend 改成 <code>supabase</code>（推荐）或 <code>custom</code>。', 'warn');
-      state.mergeLocal = false;
-      $('mergeLocalRow').classList.add('hidden');
-      renderDash();
+    var email = (els.loginEmail && els.loginEmail.value || '').trim();
+    var password = (els.loginPwd && els.loginPwd.value || '');
+
+    if (!email) {
+      setLoginMessage('请输入登录邮箱。', 'error');
+      if (els.loginEmail) { try { els.loginEmail.focus(); } catch (e) { /* ignore */ } }
+      return;
+    }
+    if (!password) {
+      setLoginMessage('请输入登录密码。', 'error');
+      if (els.loginPwd) { try { els.loginPwd.focus(); } catch (e) { /* ignore */ } }
+      return;
+    }
+
+    state.loading = true;
+    setLoginBusy(true);
+    setLoginMessage('正在登录…', 'info');
+
+    var request;
+    try {
+      request = St.admin.signIn(email, password);
+    } catch (err) {
+      state.loading = false;
+      setLoginBusy(false);
+      setLoginMessage(messageOf(err), 'error');
+      return;
+    }
+
+    request.then(function (session) {
+      state.loading = false;
+      setLoginBusy(false);
+      state.email = (session && session.email) || email;
+      setLoginMessage('', '');
+      if (els.loginPwd) els.loginPwd.value = '';
+      showView('dash');
       load();
-      return;
-    }
-
-    if (BACKEND === 'custom') {
-      var cs = CFG.custom || {};
-      if (!cs.adminUrl) {
-        notice('自定义接口模式下没有配置 <code>custom.adminUrl</code>，本页无法读取数据。' +
-          '你可以直接在服务端/表格（例如 Google 表格）里看数据，或者按 README 添加一个只读接口。', 'warn');
-      } else {
-        notice('数据来自自定义只读接口。', 'ok');
-      }
-      $('mergeLocalRow').classList.remove('hidden');
-      renderDash();
-      load();
-      return;
-    }
-
-    // Supabase
-    if (!St.supabase.ready()) {
-      notice('Supabase 还没配置好：请打开 <code>config.js</code> 填写 <code>supabase.url</code> 和 <code>supabase.anonKey</code>。', 'err');
-      renderLogin();
-      return;
-    }
-    notice('', '');
-    St.supabase.validToken().then(function (token) {
-      if (token) {
-        $('userEmail').textContent = (St.supabase.session() || {}).email || '';
-        renderDash();
-        load();
-      } else {
-        renderLogin();
+    }, function (err) {
+      state.loading = false;
+      setLoginBusy(false);
+      setLoginMessage(messageOf(err) || '登录失败，请检查邮箱和密码。', 'error');
+      if (els.loginPwd) {
+        try { els.loginPwd.select(); } catch (e) { /* ignore */ }
       }
     });
   }
 
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
-  else boot();
+  function onLogout() {
+    closeDetail();
+    try { St.admin.signOut(); } catch (e) { /* ignore */ }
+    state.email = '';
+    state.rows = [];
+    state.loaded = false;
+    state.filterType = '';
+    state.filterLegacy = '';
+    if (els.filterType) els.filterType.value = '';
+    showView('login');
+    setLoginMessage('已退出登录。', 'info');
+    if (els.loginEmail) { try { els.loginEmail.focus(); } catch (e) { /* ignore */ } }
+  }
+
+  /* ================================ 导出 ================================ */
+
+  function fileStamp() {
+    var d = new Date();
+    return d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) +
+      '-' + pad2(d.getHours()) + pad2(d.getMinutes());
+  }
+
+  function downloadBlob(filename, content, mime) {
+    try {
+      var blob = new Blob([content], { type: mime });
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(function () {
+        try {
+          if (link.parentNode) link.parentNode.removeChild(link);
+          URL.revokeObjectURL(url);
+        } catch (e) { /* ignore */ }
+      }, 1500);
+      return true;
+    } catch (err) {
+      showNotice('导出失败：' + messageOf(err), 'error', true);
+      return false;
+    }
+  }
+
+  function onExportCsv() {
+    var rows = filteredRows();
+    if (!rows.length) {
+      showNotice('当前筛选条件下没有可导出的记录。', 'info', true);
+      return;
+    }
+    if (!St || typeof St.toCSV !== 'function') {
+      showNotice('数据层未提供 CSV 导出（Store.toCSV 缺失）。', 'error', true);
+      return;
+    }
+    var csv;
+    try {
+      csv = St.toCSV(rows, S);
+    } catch (err) {
+      showNotice('CSV 生成失败：' + messageOf(err), 'error', true);
+      return;
+    }
+    if (downloadBlob('aipt-responses-' + fileStamp() + '.csv', csv, 'text/csv;charset=utf-8')) {
+      showNotice('已导出 ' + rows.length + ' 条记录为 CSV。', 'success', false);
+    }
+  }
+
+  function onExportJson() {
+    var rows = filteredRows();
+    if (!rows.length) {
+      showNotice('当前筛选条件下没有可导出的记录。', 'info', true);
+      return;
+    }
+    var text;
+    try {
+      text = JSON.stringify(rows, null, 2);
+    } catch (err) {
+      showNotice('JSON 生成失败：' + messageOf(err), 'error', true);
+      return;
+    }
+    if (downloadBlob('aipt-responses-' + fileStamp() + '.json', text, 'application/json;charset=utf-8')) {
+      showNotice('已导出 ' + rows.length + ' 条记录为 JSON。', 'success', false);
+    }
+  }
+
+  /* ============================== 答卷详情弹层 ============================== */
+
+  var detailState = {
+    row: null,
+    trigger: null,
+    copyTimer: null
+  };
+
+  function findRowById(id) {
+    if (id === null || id === undefined) return null;
+    var target = String(id);
+    for (var i = 0; i < state.rows.length; i++) {
+      var row = state.rows[i];
+      if (row && String(row.id) === target) return row;
+    }
+    return null;
+  }
+
+  function typeNameById(id) {
+    var type = E && E.typeById ? E.typeById(id) : null;
+    return type ? type.name : '';
+  }
+
+  function fmtDistance(value) {
+    var n = Number(value);
+    if (!isFinite(n)) return '—';
+    return String(Math.round(n * 10000) / 10000);
+  }
+
+  function fmtSignedNumber(value) {
+    var n = Number(value);
+    if (!isFinite(n)) return '';
+    var rounded = Math.round(n * 100) / 100;
+    return rounded > 0 ? '+' + rounded : String(rounded);
+  }
+
+  /** 从 answer_detail.score（对象或数字）里取某个维度的分值；没有该维度则取第一个数字 */
+  function scoreValue(score, dim) {
+    if (typeof score === 'number') return isFinite(score) ? score : null;
+    if (score && typeof score === 'object') {
+      if (dim && score[dim] !== undefined && score[dim] !== null && isFinite(Number(score[dim]))) {
+        return Number(score[dim]);
+      }
+      var keys = Object.keys(score);
+      for (var i = 0; i < keys.length; i++) {
+        var raw = score[keys[i]];
+        if (raw === undefined || raw === null) continue;
+        var n = Number(raw);
+        if (isFinite(n)) return n;
+      }
+    }
+    return null;
+  }
+
+  function scoreBadgeText(score, dim) {
+    var value = scoreValue(score, dim);
+    return value === null ? '' : fmtSignedNumber(value);
+  }
+
+  /** 旧版 answer_detail 的 score 可能带多个维度，拼成 “+2 / -1” */
+  function scoreBadgeFull(score) {
+    if (typeof score === 'number') return fmtSignedNumber(score);
+    if (score && typeof score === 'object') {
+      var parts = [];
+      Object.keys(score).forEach(function (key) {
+        var raw = score[key];
+        if (raw === undefined || raw === null) return;
+        var text = fmtSignedNumber(raw);
+        if (text) parts.push(text);
+      });
+      return parts.join(' / ');
+    }
+    return '';
+  }
+
+  function metaItem(label, value, opts) {
+    opts = opts || {};
+    var item = el('div', 'adm-detail-meta-item');
+    item.appendChild(el('dt', 'adm-detail-meta-label mono', label));
+    var text = value === undefined || value === null || value === '' ? '—' : String(value);
+    var dd = el('dd', 'adm-detail-meta-value' + (opts.mono ? ' is-mono' : '') +
+      (opts.clamp ? ' is-clamp' : ''), text);
+    if (opts.title && value) dd.title = String(value);
+    item.appendChild(dd);
+    return item;
+  }
+
+  function renderDetailTitle(row) {
+    if (!els.detailTitle) return;
+    clear(els.detailTitle);
+    var isNew = isNewVersion(row);
+    var type = typeOf(row);
+    var name = isNew
+      ? ((type && type.name) || row.result_name || '未知机体')
+      : (row.result_name || '旧版类型');
+    var code = isNew
+      ? ((type && type.id) || row.result_code || '')
+      : (row.result_code || '');
+    els.detailTitle.appendChild(el('span', 'adm-detail-name', name));
+    if (code) {
+      els.detailTitle.appendChild(el('span', 'adm-detail-code mono' + (isNew ? '' : ' is-legacy'), code));
+    }
+  }
+
+  function renderDetailFlags(row) {
+    if (!els.detailFlags) return;
+    clear(els.detailFlags);
+    var chips = [];
+    if (isTie(row)) chips.push({ text: '并列', cls: ' adm-detail-flag--tie' });
+    if (isAllNeutral(row)) chips.push({ text: '全中性', cls: ' adm-detail-flag--neutral' });
+    if (!isTie(row) && isNear(row)) chips.push({ text: '近似', cls: ' adm-detail-flag--near' });
+    if (!chips.length) {
+      els.detailFlags.appendChild(el('span', 'adm-detail-flag-empty mono', '无并列 / 全中性 / 近似标记'));
+      return;
+    }
+    chips.forEach(function (chip) {
+      els.detailFlags.appendChild(el('span', 'adm-detail-flag' + chip.cls + ' mono', chip.text));
+    });
+  }
+
+  function renderDetailMeta(row, match) {
+    var meta = els.detailMeta;
+    if (!meta) return;
+    clear(meta);
+
+    var answered = Number(row.answered);
+    var total = Number(row.total);
+    var progress = (isFinite(answered) && isFinite(total) && total > 0)
+      ? answered + ' / ' + total + (isComplete(row) ? ' · 已完成' : ' · 未完成')
+      : '—';
+    var env = [row.lang, row.screen, row.timezone]
+      .filter(function (value) { return !!value; })
+      .join(' · ');
+
+    meta.appendChild(metaItem('提交时间', fmtTime(row.created_at)));
+    meta.appendChild(metaItem('问卷版本', row.survey_version || '—', { mono: true }));
+    meta.appendChild(metaItem('昵称', row.nickname ? String(row.nickname) : '（未填写）'));
+    meta.appendChild(metaItem('用时', fmtDuration(durationOf(row))));
+    meta.appendChild(metaItem('完成题数', progress));
+    meta.appendChild(metaItem('设备 UA', row.user_agent || '—', { clamp: true, title: row.user_agent }));
+    meta.appendChild(metaItem('来源 referrer', row.referrer || '—', { clamp: true, title: row.referrer }));
+    meta.appendChild(metaItem('语言 / 屏幕 / 时区', env || '—'));
+
+    // 旧版记录没有 percents.match 时，这几行整体隐藏
+    if (match) {
+      var candidates = Array.isArray(match.candidates) ? match.candidates : [];
+      var candidateText = candidates.map(function (id) {
+        var name = typeNameById(id);
+        return name ? String(id) + ' ' + name : String(id);
+      }).join('、');
+      meta.appendChild(metaItem('profileCode', match.profileCode || '—', { mono: true }));
+      meta.appendChild(metaItem('并列候选', candidateText || '—'));
+      meta.appendChild(metaItem('最佳距离', fmtDistance(match.bestDistance), { mono: true }));
+      meta.appendChild(metaItem('次佳距离', fmtDistance(match.secondDistance), { mono: true }));
+    }
+  }
+
+  function renderDetailDims(row) {
+    var box = els.detailDims;
+    if (!box) return;
+    clear(box);
+
+    DIM_ORDER.forEach(function (key) {
+      var dim = DIMS[key] || {};
+      var p = row.percents && row.percents[key];
+      var leftValue = p ? Number(p.left) : NaN;
+      var hasPercents = isFinite(leftValue);
+      var left = hasPercents ? Math.max(0, Math.min(100, leftValue)) : null;
+      var rightValue = p ? Number(p.right) : NaN;
+      var right = hasPercents
+        ? (isFinite(rightValue) ? Math.max(0, Math.min(100, rightValue)) : 100 - left)
+        : null;
+
+      var leftName = (p && p.leftName) || (dim.left && dim.left.name) || '左侧';
+      var rightName = (p && p.rightName) || (dim.right && dim.right.name) || '右侧';
+
+      var raw = row.scores ? row.scores[key] : undefined;
+      if (raw === undefined || raw === null || raw === '') raw = p ? p.raw : undefined;
+      var rawNumber = Number(raw);
+      var hasRaw = raw !== undefined && raw !== null && raw !== '' && isFinite(rawNumber);
+
+      var wrap = el('div', 'adm-detail-dim');
+
+      var head = el('div', 'adm-detail-dim-head');
+      head.appendChild(el('span', 'adm-detail-dim-label', dim.label || key));
+      head.appendChild(el('span', 'adm-detail-dim-raw mono',
+        hasRaw ? '原始分 ' + fmtSignedNumber(rawNumber) : '原始分 —'));
+      wrap.appendChild(head);
+
+      var poles = el('div', 'adm-detail-dim-poles');
+      poles.appendChild(el('span', 'adm-detail-pole',
+        leftName + ' ' + (left === null ? '—' : left + '%')));
+      poles.appendChild(el('span', 'adm-detail-pole adm-detail-pole--right',
+        rightName + ' ' + (right === null ? '—' : right + '%')));
+      wrap.appendChild(poles);
+
+      var track = el('div', 'adm-detail-dim-track');
+      track.setAttribute('role', 'img');
+      track.setAttribute('aria-label',
+        leftName + ' ' + (left === null ? '—' : left + '%') + ' / ' +
+        rightName + ' ' + (right === null ? '—' : right + '%'));
+      var leftBar = el('span', 'adm-detail-dim-left');
+      leftBar.style.width = (left === null ? 0 : left) + '%';
+      var rightBar = el('span', 'adm-detail-dim-right');
+      rightBar.style.width = (right === null ? 0 : right) + '%';
+      track.appendChild(leftBar);
+      track.appendChild(rightBar);
+      wrap.appendChild(track);
+
+      box.appendChild(wrap);
+    });
+  }
+
+  function buildDetailMap(row) {
+    var map = {};
+    var list = Array.isArray(row.answer_detail) ? row.answer_detail : [];
+    list.forEach(function (item) {
+      if (item && item.id) map[String(item.id)] = item;
+    });
+    return map;
+  }
+
+  function resolveAnswer(question, row) {
+    var options = question.options || [];
+    var raw = row.answers ? row.answers[question.id] : undefined;
+    var idx = Number(raw);
+    if (raw !== undefined && raw !== null && raw !== '' && isFinite(idx) &&
+        Math.floor(idx) === idx && idx >= 0 && idx < options.length) {
+      return { index: idx };
+    }
+    return { missing: true };
+  }
+
+  /** 新版：按当前题库顺序渲染 16 题，缺题/非法下标显示「未作答」 */
+  function renderNewAnswers(row, container) {
+    var questions = S.questions || [];
+    var detailMap = buildDetailMap(row);
+
+    questions.forEach(function (question) {
+      var detail = detailMap[question.id] || null;
+      var block = el('div', 'adm-detail-q');
+
+      var head = el('div', 'adm-detail-q-head');
+      head.appendChild(el('span', 'adm-detail-q-id mono', String(question.id || '').toUpperCase()));
+      var dim = DIMS[question.dim];
+      head.appendChild(el('span', 'adm-detail-q-dim mono', (dim && dim.label) || question.dim || ''));
+      block.appendChild(head);
+
+      block.appendChild(el('p', 'adm-detail-q-text', question.text || ''));
+
+      var resolved = resolveAnswer(question, row);
+      var selectedIndex = resolved.missing ? null : resolved.index;
+      var textOnly = '';
+
+      if (selectedIndex === null && detail) {
+        var detailIndex = Number(detail.index);
+        var options = question.options || [];
+        if (detail.index !== undefined && detail.index !== null && isFinite(detailIndex) &&
+            Math.floor(detailIndex) === detailIndex && detailIndex >= 0 && detailIndex < options.length) {
+          selectedIndex = detailIndex;
+        } else if (detail.text) {
+          for (var i = 0; i < options.length; i++) {
+            if (options[i].text === detail.text) { selectedIndex = i; break; }
+          }
+          if (selectedIndex === null) textOnly = String(detail.text);
+        }
+      }
+
+      if (selectedIndex === null) {
+        if (textOnly) {
+          block.appendChild(el('p', 'adm-detail-answer-text', '记录中所选：' + textOnly));
+        } else {
+          block.appendChild(el('p', 'adm-detail-missing', '未作答'));
+        }
+      } else {
+        var optionsWrap = el('div', 'adm-detail-options');
+        (question.options || []).forEach(function (option, optIndex) {
+          var isSelected = optIndex === selectedIndex;
+          var opt = el('div', 'adm-detail-option' + (isSelected ? ' is-selected' : ''));
+          opt.appendChild(el('span', 'adm-detail-option-text', option.text || ''));
+          if (isSelected) {
+            opt.appendChild(el('span', 'adm-detail-selected-tag mono', '所选'));
+            var badge = detail ? scoreBadgeText(detail.score, question.dim) : '';
+            if (!badge) badge = scoreBadgeText(option.scores, question.dim);
+            if (badge) opt.appendChild(el('span', 'adm-detail-score mono', badge));
+          }
+          optionsWrap.appendChild(opt);
+        });
+        block.appendChild(optionsWrap);
+      }
+
+      container.appendChild(block);
+    });
+  }
+
+  /** 旧版：优先按 answer_detail 的文本与顺序展示；为空再按下标 + 当前题库兜底 */
+  function renderLegacyAnswers(row) {
+    var container = els.detailAnswers;
+    var note = els.detailAnswersNote;
+    var items = Array.isArray(row.answer_detail) ? row.answer_detail.filter(function (item) {
+      return !!item && (item.id || item.text);
+    }) : [];
+
+    if (items.length) {
+      if (note) {
+        note.hidden = false;
+        note.textContent = '旧版记录只保留所选答案文本；旧版题目文本可能与当前题库不同，下面按记录中的顺序展示。';
+      }
+      var list = el('ol', 'adm-detail-old-list');
+      items.forEach(function (item, index) {
+        var li = el('li', 'adm-detail-old-item');
+        var head = el('div', 'adm-detail-old-head');
+        head.appendChild(el('span', 'adm-detail-q-id mono',
+          item.id ? String(item.id).toUpperCase() : '第 ' + (index + 1) + ' 题'));
+        var badge = scoreBadgeFull(item.score);
+        if (badge) head.appendChild(el('span', 'adm-detail-score mono', badge));
+        li.appendChild(head);
+        li.appendChild(el('p', 'adm-detail-old-text', item.text || '（这条记录没有保存答案文本）'));
+        list.appendChild(li);
+      });
+      container.appendChild(list);
+      return;
+    }
+
+    var hasAnswers = row.answers && typeof row.answers === 'object' &&
+      Object.keys(row.answers).length > 0;
+    if (hasAnswers) {
+      if (note) {
+        note.hidden = false;
+        note.textContent = '旧版记录没有逐题答案文本，以下按当前题库和记录里的选项下标推断；题目文本可能与当时不同。';
+      }
+      renderNewAnswers(row, container);
+      return;
+    }
+
+    if (note) {
+      note.hidden = false;
+      note.textContent = '该旧版记录没有保存逐题答案（旧版数据可能只保存了结果）。';
+    }
+    container.appendChild(el('p', 'adm-detail-empty', '没有可展示的逐题答案。'));
+  }
+
+  function renderDetailAnswers(row) {
+    var container = els.detailAnswers;
+    if (!container) return;
+    clear(container);
+    if (els.detailAnswersNote) {
+      els.detailAnswersNote.hidden = true;
+      els.detailAnswersNote.textContent = '';
+    }
+    if (isNewVersion(row)) renderNewAnswers(row, container);
+    else renderLegacyAnswers(row);
+  }
+
+  function renderDetail(row) {
+    setDetailCopyMessage('', '');
+    renderDetailTitle(row);
+    renderDetailFlags(row);
+    renderDetailMeta(row, matchMeta(row));
+    renderDetailDims(row);
+    renderDetailAnswers(row);
+  }
+
+  function setDetailCopyMessage(msg, kind) {
+    var node = els.detailCopyMsg;
+    if (!node) return;
+    if (detailState.copyTimer) {
+      clearTimeout(detailState.copyTimer);
+      detailState.copyTimer = null;
+    }
+    node.textContent = msg || '';
+    node.className = 'adm-detail-copy-msg' + (kind ? ' is-' + kind : '');
+    node.hidden = !msg;
+    if (msg) {
+      detailState.copyTimer = setTimeout(function () {
+        node.hidden = true;
+        node.textContent = '';
+      }, 3200);
+    }
+  }
+
+  function copyTextToClipboard(text) {
+    return new Promise(function (resolve) {
+      function fallback() {
+        var ok = false;
+        try {
+          var area = document.createElement('textarea');
+          area.value = text;
+          area.setAttribute('readonly', 'readonly');
+          area.style.position = 'fixed';
+          area.style.top = '-1000px';
+          area.style.opacity = '0';
+          document.body.appendChild(area);
+          area.select();
+          try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+          document.body.removeChild(area);
+        } catch (e) { ok = false; }
+        resolve(ok);
+      }
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).then(function () { resolve(true); }, fallback);
+      } else {
+        fallback();
+      }
+    });
+  }
+
+  function onDetailCopy() {
+    if (!detailState.row) return;
+    var text;
+    try {
+      text = JSON.stringify(detailState.row, null, 2);
+    } catch (err) {
+      setDetailCopyMessage('复制失败：' + messageOf(err), 'error');
+      return;
+    }
+    copyTextToClipboard(text).then(function (ok) {
+      setDetailCopyMessage(
+        ok ? '已复制该答卷 JSON 到剪贴板。' : '复制失败，请手动选择文本复制。',
+        ok ? 'success' : 'error'
+      );
+    });
+  }
+
+  function openDetail(id, trigger) {
+    var row = findRowById(id);
+    if (!row || !els.detailModal) return;
+
+    var focusTarget = trigger || null;
+    if (focusTarget && focusTarget.tagName === 'TR') {
+      focusTarget = (focusTarget.querySelector && focusTarget.querySelector('button[data-view]')) || focusTarget;
+    }
+
+    detailState.row = row;
+    detailState.trigger = focusTarget;
+
+    renderDetail(row);
+    els.detailModal.hidden = false;
+    document.body.classList.add('adm-modal-open');
+    try { els.detailModal.scrollTop = 0; } catch (e) { /* ignore */ }
+    if (els.detailClose) {
+      try { els.detailClose.focus({ preventScroll: true }); }
+      catch (e) { try { els.detailClose.focus(); } catch (e2) { /* ignore */ } }
+    }
+  }
+
+  function closeDetail() {
+    if (!els.detailModal || els.detailModal.hidden) return;
+    els.detailModal.hidden = true;
+    document.body.classList.remove('adm-modal-open');
+    setDetailCopyMessage('', '');
+
+    var trigger = detailState.trigger;
+    detailState.trigger = null;
+    detailState.row = null;
+
+    if (trigger) {
+      var target = trigger;
+      if (target.isConnected === false) target = els.refreshBtn || null;
+      if (target && typeof target.focus === 'function') {
+        try { target.focus({ preventScroll: true }); }
+        catch (e) { try { target.focus(); } catch (e2) { /* ignore */ } }
+      }
+    }
+  }
+
+  function onDetailModalClick(event) {
+    var target = event && event.target;
+    if (!target) return;
+    if (target === els.detailModal || target === els.detailBackdrop) closeDetail();
+  }
+
+  function onDocumentKeydown(event) {
+    if (!event) return;
+    var key = event.key;
+    if (key === 'Escape' || key === 'Esc' || event.keyCode === 27) {
+      if (els.detailModal && !els.detailModal.hidden) {
+        if (event.preventDefault) event.preventDefault();
+        closeDetail();
+      }
+    }
+  }
+
+  /* ================================ 删除 ================================ */
+
+  function handleDeleteClick(btn) {
+    var id = btn.getAttribute('data-del');
+    if (!id) return;
+    if (!window.confirm('确定删除这条答卷吗？删除后无法恢复。')) return;
+    if (!St || !St.admin || typeof St.admin.remove !== 'function') {
+      showNotice('数据层没有就绪：Store.admin.remove 缺失。', 'error', true);
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = '删除中';
+
+    var request;
+    try {
+      request = St.admin.remove(id);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = '删除';
+      handleRemoveError(err);
+      return;
+    }
+
+    request.then(function () {
+      load({ successMsg: '已删除 1 条答卷。' });
+    }, function (err) {
+      btn.disabled = false;
+      btn.textContent = '删除';
+      handleRemoveError(err);
+    });
+  }
+
+  function onTableClick(event) {
+    var target = event && event.target;
+    if (!target || !target.closest) return;
+
+    var deleteBtn = target.closest('button[data-del]');
+    if (deleteBtn) {
+      handleDeleteClick(deleteBtn);
+      return;
+    }
+
+    var viewBtn = target.closest('button[data-view]');
+    if (viewBtn) {
+      openDetail(viewBtn.getAttribute('data-view'), viewBtn);
+      return;
+    }
+
+    // 整行可点：点到按钮/链接/输入等交互元素时忽略
+    if (target.closest('a, button, input, select, textarea, label')) return;
+    var tr = target.closest('tr[data-id]');
+    if (tr) openDetail(tr.getAttribute('data-id'), tr);
+  }
+
+  /* ================================ 事件绑定 ================================ */
+
+  function buildTypeFilter() {
+    var select = els.filterType;
+    if (!select) return;
+    clear(select);
+
+    var all = document.createElement('option');
+    all.value = '';
+    all.textContent = '全部机体';
+    select.appendChild(all);
+
+    ((E && E.types) || []).forEach(function (type) {
+      var option = document.createElement('option');
+      option.value = type.id;
+      option.textContent = type.name;
+      select.appendChild(option);
+    });
+
+    select.value = state.filterType || '';
+  }
+
+  function onVersionChange(event) {
+    state.filterVersion = event.target.value;
+    state.filterLegacy = '';
+    if (state.filterVersion === 'old') {
+      // 旧版数据没有 8 机体编号，清掉机体筛选避免空表
+      state.filterType = '';
+      if (els.filterType) els.filterType.value = '';
+    }
+    renderAll();
+  }
+
+  function onRangeChange(event) {
+    state.filterRange = event.target.value;
+    renderAll();
+  }
+
+  function onTypeSelectChange(event) {
+    state.filterType = event.target.value;
+    state.filterLegacy = '';
+    renderAll();
+  }
+
+  function onTypeChartClick(event) {
+    var target = event && event.target;
+    if (!target || !target.closest) return;
+    var btn = target.closest('button[data-code]');
+    if (!btn) return;
+    var code = btn.getAttribute('data-code');
+    state.filterType = state.filterType === code ? '' : code;
+    state.filterLegacy = '';
+    if (els.filterType) els.filterType.value = state.filterType;
+    renderAll();
+  }
+
+  function onLegacyChartClick(event) {
+    var target = event && event.target;
+    if (!target || !target.closest) return;
+    var btn = target.closest('button[data-legacy]');
+    if (!btn) return;
+    var code = btn.getAttribute('data-legacy');
+    state.filterLegacy = state.filterLegacy === code ? '' : code;
+    state.filterType = '';
+    if (els.filterType) els.filterType.value = '';
+    renderAll();
+  }
+
+  function bindEvents() {
+    on(els.loginForm, 'submit', onLoginSubmit);
+    on(els.logoutBtn, 'click', onLogout);
+    on(els.refreshBtn, 'click', function () { load(); });
+    on(els.exportCsv, 'click', onExportCsv);
+    on(els.exportJson, 'click', onExportJson);
+    on(els.filterVersion, 'change', onVersionChange);
+    on(els.filterRange, 'change', onRangeChange);
+    on(els.filterType, 'change', onTypeSelectChange);
+    on(els.tableBody, 'click', onTableClick);
+    on(els.typeChart, 'click', onTypeChartClick);
+    on(els.legacyChart, 'click', onLegacyChartClick);
+    on(els.detailModal, 'click', onDetailModalClick);
+    on(els.detailClose, 'click', function () { closeDetail(); });
+    on(els.detailCopy, 'click', onDetailCopy);
+    on(document, 'keydown', onDocumentKeydown);
+    on(window, 'keydown', onDocumentKeydown);
+  }
+
+  /* ================================ 启动 ================================ */
+
+  function cacheElements() {
+    els.viewLogin = $('viewLogin');
+    els.viewDash = $('viewDash');
+    els.loginForm = $('loginForm');
+    els.loginEmail = $('loginEmail');
+    els.loginPwd = $('loginPwd');
+    els.loginBtn = $('loginBtn');
+    els.loginMsg = $('loginMsg');
+    els.loginLead = $('loginLead');
+    els.logoutBtn = $('logoutBtn');
+    els.refreshBtn = $('refreshBtn');
+    els.exportCsv = $('exportCsv');
+    els.exportJson = $('exportJson');
+    els.kpis = $('kpis');
+    els.typeChart = $('typeChart');
+    els.typeMeta = $('typeMeta');
+    els.legacyBlock = $('legacyBlock');
+    els.legacyChart = $('legacyChart');
+    els.dimChart = $('dimChart');
+    els.trendChart = $('trendChart');
+    els.trendNote = $('trendNote');
+    els.questionStats = $('questionStats');
+    els.questionMeta = $('questionMeta');
+    els.tableBody = $('tableBody');
+    els.tableInfo = $('tableInfo');
+    els.filterVersion = $('filterVersion');
+    els.filterRange = $('filterRange');
+    els.filterType = $('filterType');
+    els.notice = $('notice');
+    els.modeBanner = $('modeBanner');
+    els.statusSource = $('statusSource');
+    els.statusVersion = $('statusVersion');
+    els.statusEmail = $('statusEmail');
+    els.statusCount = $('statusCount');
+    els.footerTable = $('footerTable');
+    els.detailModal = $('detailModal');
+    els.detailBackdrop = $('detailBackdrop');
+    els.detailTitle = $('detailTitle');
+    els.detailMeta = $('detailMeta');
+    els.detailFlags = $('detailFlags');
+    els.detailDims = $('detailDims');
+    els.detailAnswers = $('detailAnswers');
+    els.detailAnswersNote = $('detailAnswersNote');
+    els.detailCopy = $('detailCopy');
+    els.detailClose = $('detailClose');
+    els.detailCopyMsg = $('detailCopyMsg');
+  }
+
+  function showFatal(msg) {
+    if (els.viewLogin) {
+      showView('login');
+      setLoginMessage(msg, 'error');
+      if (els.loginForm) els.loginForm.hidden = true;
+      if (els.loginLead) els.loginLead.textContent = '数据后台没有加载成功，暂时无法使用。';
+    }
+  }
+
+  function enterLocalMode() {
+    state.source = 'local';
+    state.email = '';
+    if (els.modeBanner) {
+      els.modeBanner.hidden = false;
+      els.modeBanner.textContent = '本地模式 · 仅显示本机浏览器记录';
+    }
+    if (els.logoutBtn) els.logoutBtn.hidden = true;
+    showView('dash');
+    renderStatus();
+    load();
+  }
+
+  function enterCustomMode() {
+    state.source = 'custom';
+    showView('login');
+    if (els.loginForm) els.loginForm.hidden = true;
+    if (els.loginLead) {
+      els.loginLead.textContent = '这个数据后台只支持 Supabase 云端数据或本机 local 记录，自定义接口模式暂不提供查看面板。';
+    }
+    setLoginMessage('当前为自定义接口模式，本后台未配置。', 'warn');
+  }
+
+  function enterConfigError() {
+    state.source = 'supabase';
+    showView('login');
+    if (els.loginForm) els.loginForm.hidden = true;
+    if (els.loginLead) {
+      els.loginLead.textContent = 'Supabase 配置不完整，暂时无法登录读取数据。';
+    }
+    setLoginMessage('config.js 里的 supabase.url / anonKey 没有配置完整，请检查后刷新页面。', 'error');
+  }
+
+  function enterSupabaseMode() {
+    state.source = 'supabase';
+    if (els.logoutBtn) els.logoutBtn.hidden = false;
+
+    var session = null;
+    try { session = St.admin.session(); } catch (e) { session = null; }
+
+    if (session && session.access_token) {
+      state.email = session.email || '';
+      showView('dash');
+      renderStatus();
+      load();
+      return;
+    }
+
+    showView('login');
+    renderStatus();
+  }
+
+  function boot() {
+    cacheElements();
+
+    if (!St || !St.admin || typeof St.admin.dataSource !== 'function') {
+      showFatal('数据层没有就绪：Store.admin 缺失，请检查 assets/js/store.js 是否加载。');
+      return;
+    }
+
+    bindEvents();
+    buildTypeFilter();
+
+    if (els.footerTable) {
+      var tableName = (CFG.supabase && CFG.supabase.table) || 'ai_personality_responses';
+      els.footerTable.textContent = tableName;
+    }
+
+    var source;
+    try {
+      source = St.admin.dataSource();
+    } catch (err) {
+      showFatal('无法读取当前数据源：' + messageOf(err));
+      return;
+    }
+    state.source = source || 'local';
+
+    if (state.source === 'local') {
+      enterLocalMode();
+      return;
+    }
+    if (state.source === 'custom') {
+      enterCustomMode();
+      return;
+    }
+
+    // supabase
+    var ready = false;
+    try { ready = St.admin.ready(); } catch (e) { ready = false; }
+    if (!ready) {
+      enterConfigError();
+      return;
+    }
+    enterSupabaseMode();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
 })();

@@ -1,8 +1,8 @@
 /**
- * 一键重新生成预览截图：
+ * 一键重新生成预览截图（新版 8 机体 UI）：
  *   node tests/screenshots.mjs
- * 输出到 tests/screenshots/
- * 其中「诊断面板」那张需要 mock Supabase（tests/mock-server.mjs），脚本会自己起。
+ * 输出到 tests/screenshots/（已在 .gitignore 里，不会提交）
+ * 移动端用 iframe 390px 宽模拟，避免 headless Chrome 最小窗口宽度限制。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,32 +19,30 @@ if (!findChrome()) {
 const OUT = path.join(ROOT, 'tests', 'screenshots');
 fs.mkdirSync(OUT, { recursive: true });
 
-const staticPort = await findFreePort(9500, 9700);
-const mockPort = await findFreePort(9701, 9899);
-const staticBase = `http://127.0.0.1:${staticPort}`;
-const mockBase = `http://127.0.0.1:${mockPort}`;
-const staticServer = startServer('serve.mjs', staticPort, ['--force-local']);
-const mockServer = startServer('mock-server.mjs', mockPort);
+const port = await findFreePort(9500, 9700);
+const base = `http://127.0.0.1:${port}`;
+const server = startServer('serve.mjs', port, ['--force-local']);
 
 const shots = [
-  ['1-intro.png', staticBase + '/index.html', 1180, 1250],
-  ['2-quiz.png', staticBase + '/tests/preview.html?stage=quiz', 1180, 1000],
-  ['3-result.png', staticBase + '/tests/preview.html?stage=result', 1180, 2300],
-  ['4-admin.png', staticBase + '/tests/preview.html?stage=admin', 1180, 2150],
-  ['5-share.png', staticBase + '/index.html?result=EWSC', 1180, 1300],
-  ['6-diagnose.png', mockBase + '/tests/preview-diag.html', 1180, 1250]
+  // 桌面：首屏 / 答题 / 结果 / 并列结果 / 分享落地页
+  ['1-intro.png', '/tests/preview.html?stage=intro', 1400, 1300],
+  ['2-quiz.png', '/tests/preview.html?stage=quiz', 1360, 1100],
+  ['3-result.png', '/tests/preview.html?stage=result', 1360, 2350],
+  ['4-result-neutral.png', '/tests/preview.html?stage=result-neutral', 1360, 2800],
+  ['5-share.png', '/tests/preview.html?stage=share', 1360, 1350],
+  // 移动端：390px 宽
+  ['6-intro-mobile.png', '/tests/preview.html?stage=intro&w=mobile', 600, 1850],
+  ['7-result-mobile.png', '/tests/preview.html?stage=result&w=mobile', 600, 4000]
 ];
 
 try {
-  await waitForServer(staticBase + '/index.html', (t) => t.includes('__FORCED_LOCAL__'));
-  await waitForServer(mockBase + '/__rows', (t) => t.trim() === '[]');
+  await waitForServer(base + '/index.html', (t) => t.includes('__FORCED_LOCAL__'));
   for (const [name, url, w, h] of shots) {
     const out = path.join(OUT, name);
-    const ok = screenshot(url, out, w, h);
+    const ok = screenshot(base + url, out, w, h);
     console.log('  ' + name + ' → ' + (ok ? Math.round(fs.statSync(out).size / 1024) + ' KB' : '失败'));
   }
   console.log('截图完成：tests/screenshots/');
 } finally {
-  stopServer(staticServer);
-  stopServer(mockServer);
+  stopServer(server);
 }

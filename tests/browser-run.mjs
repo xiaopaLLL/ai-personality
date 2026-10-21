@@ -96,7 +96,7 @@ export function runChromeDump(url, opts) {
   try {
     spawnSync(chrome, [
       '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
-      '--disable-extensions', '--mute-audio', '--hide-scrollbars',
+      '--disable-extensions', '--mute-audio', '--hide-scrollbars', '--force-prefers-reduced-motion',
       '--user-data-dir=' + path.join(profile, 'data'),
       '--virtual-time-budget=' + (opts.budget || 60000),
       '--dump-dom', url
@@ -118,7 +118,8 @@ export function screenshot(url, outPath, width, height) {
   const fd = fs.openSync(path.join(profile, 'log.txt'), 'w');
   try {
     spawnSync(chrome, [
-      '--headless=new', '--disable-gpu', '--no-first-run', '--hide-scrollbars',
+      '--headless=new', '--disable-gpu', '--no-first-run', '--hide-scrollbars', '--force-prefers-reduced-motion',
+      '--run-all-compositor-stages-before-draw',
       '--user-data-dir=' + path.join(profile, 'data'),
       '--window-size=' + width + ',' + height, '--virtual-time-budget=45000',
       '--screenshot=' + outPath, url

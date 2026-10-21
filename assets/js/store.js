@@ -1,24 +1,16 @@
 /* =============================================================================
- *  数据层：三种后端的统一封装（local / supabase / custom）
+ *  数据层：把一次作答组装成记录，并提交到 Supabase（或自定义接口 / 本地）。
  * =============================================================================
- *  对外接口（浏览器全局 Store）：
- *    Store.buildRecord(survey, result, answers, opts)  组装一条记录
- *    Store.submit(record) -> Promise<{ok, mode, queued?, error?}>
- *    Store.flushPending()                              重发本地暂存的上传
- *    Store.pendingCount()
- *    Store.listLocal() / Store.clearLocal() / Store.deleteLocal(id)
- *    Store.importRows(rows)                            把导出的 JSON 合进本地库
- *    Store.toCSV(rows, survey)                         导出 CSV 文本
- *    Store.supabase.signIn(email, pwd) / signOut() / session()
- *    Store.admin.fetchRows(opts) / remove(id)
+ *  前端只负责静默提交，不展示任何“后台/云端/上传成功”之类的状态。
+ *  记录字段严格对应 supabase/schema.sql 里已有的列；
+ *  新增的匹配元数据放在 percents.match 这个 JSON 字段里，不需要改表结构。
  * ========================================================================== */
 
 (function (root) {
   'use strict';
 
-  var KEY_PENDING = 'aipt:pending:v1';
-  var KEY_LOCAL = 'aipt:local:v1';
-  var KEY_SESSION = 'aipt:session:v1';
+  var KEY_PENDING = 'aipt:pending:v2';
+  var KEY_LOCAL = 'aipt:local:v2';
   var LOCAL_LIMIT = 3000;
 
   /* ------------------------------ 小工具 ------------------------------ */
@@ -37,6 +29,11 @@
   }
 
   function iso() { return new Date().toISOString(); }
+
+  function round6(v) {
+    if (v === null || v === undefined || !isFinite(v)) return null;
+    return Math.round(v * 1e6) / 1e6;
+  }
 
   function store(key, val) {
     try {
@@ -71,7 +68,7 @@
     if (typeof AbortController !== 'undefined') {
       var ctrl = new AbortController();
       opt.signal = ctrl.signal;
-      var timer = setTimeout(function () { ctrl.abort(); }, ms || 10000);
+      var timer = setTimeout(function () { ctrl.abort(); }, ms || 12000);
       return root.fetch(url, opt).then(function (r) { clearTimeout(timer); return r; },
         function (e) { clearTimeout(timer); throw e; });
     }
@@ -79,34 +76,6 @@
   }
 
   /* ------------------------------ 组装记录 ------------------------------ */
-
-  function buildRecord(survey, result, answers, opts) {
-    opts = opts || {};
-    var c = cfg().collect || {};
-    var env = opts.env || {};
-    var rec = {
-      id: uid(),
-      created_at: iso(),
-      survey_id: (survey.meta && survey.meta.id) || 'survey',
-      survey_version: (survey.meta && survey.meta.version) || 'v0',
-      result_code: result.code,
-      result_name: result.name,
-      scores: result.scores,
-      percents: result.percents,
-      answers: answers,
-      answer_detail: result.detail,
-      answered: result.answered,
-      total: result.total,
-      duration_ms: c.duration === false ? null : (opts.durationMs || null)
-    };
-    if (c.nickname !== false && opts.nickname) rec.nickname = String(opts.nickname).slice(0, 40);
-    if (c.userAgent !== false) rec.user_agent = env.userAgent || null;
-    if (c.referrer !== false) rec.referrer = env.referrer || null;
-    if (c.language !== false) rec.lang = env.lang || null;
-    if (c.screen !== false) rec.screen = env.screen || null;
-    if (c.timezone !== false) rec.timezone = env.timezone || null;
-    return drop(rec);
-  }
 
   function collectEnv() {
     var nav = root.navigator || {};
@@ -122,9 +91,67 @@
     };
   }
 
+  function buildRecord(survey, result, answers, opts) {
+    opts = opts || {};
+    var c = cfg().collect || {};
+    var env = opts.env || {};
+    var display = result.display || (result.candidates && result.candidates[0]) || null;
+    var keys = Object.keys((survey && survey.dimensions) || {});
+    var percents = {};
+
+    keys.forEach(function (k) {
+      var p = (result.percents || {})[k];
+      if (!p) return;
+      percents[k] = {
+        left: p.left,
+        right: p.right,
+        leftName: p.leftName,
+        rightName: p.rightName,
+        pole: p.pole,
+        raw: p.raw
+      };
+    });
+
+    percents.match = {
+      profileCode: result.profileCode || '',
+      display: display ? display.id : '',
+      candidates: (result.candidates || []).map(function (t) { return t.id; }),
+      tie: !!result.tie,
+      allNeutral: !!result.allNeutral,
+      near: (result.near || []).map(function (t) { return t.id; }),
+      bestDistance: round6(result.bestDistance),
+      secondDistance: round6(result.secondDistance)
+    };
+
+    var rec = {
+      id: uid(),
+      created_at: iso(),
+      survey_id: (survey.meta && survey.meta.id) || 'survey',
+      survey_version: (survey.meta && survey.meta.version) || 'v0',
+      result_code: display ? display.id : '',
+      result_name: display ? display.name : '',
+      scores: result.raw || {},
+      percents: percents,
+      answers: answers || {},
+      answer_detail: result.detail || [],
+      answered: result.answered,
+      total: result.total,
+      duration_ms: c.duration === false ? null : (opts.durationMs || null)
+    };
+
+    if (c.nickname !== false && opts.nickname) rec.nickname = String(opts.nickname).slice(0, 40);
+    if (c.userAgent !== false) rec.user_agent = env.userAgent || null;
+    if (c.referrer !== false) rec.referrer = env.referrer || null;
+    if (c.language !== false) rec.lang = env.lang || null;
+    if (c.screen !== false) rec.screen = env.screen || null;
+    if (c.timezone !== false) rec.timezone = env.timezone || null;
+    return drop(rec);
+  }
+
   /* ------------------------------ 本地暂存 ------------------------------ */
 
   function listLocal() { return readJSON(KEY_LOCAL, []); }
+  function clearLocal() { writeJSON(KEY_LOCAL, []); }
 
   function saveLocal(rec) {
     var all = listLocal();
@@ -138,28 +165,9 @@
     writeJSON(KEY_LOCAL, listLocal().filter(function (r) { return r.id !== id; }));
   }
 
-  function clearLocal() { writeJSON(KEY_LOCAL, []); }
-
-  function importRows(rows) {
-    var all = listLocal();
-    var have = {};
-    all.forEach(function (r) { have[r.id] = true; });
-    var added = 0;
-    (rows || []).forEach(function (r) {
-      if (!r || !r.id || have[r.id]) return;
-      have[r.id] = true;
-      all.push(r);
-      added++;
-    });
-    all.sort(function (a, b) { return String(b.created_at).localeCompare(String(a.created_at)); });
-    writeJSON(KEY_LOCAL, all.slice(0, LOCAL_LIMIT));
-    return added;
-  }
-
   /* ------------------------------ 待重发队列 ------------------------------ */
 
   function pendingList() { return readJSON(KEY_PENDING, []); }
-
   function pendingCount() { return pendingList().length; }
 
   function enqueue(rec) {
@@ -191,7 +199,11 @@
 
   function sbConf() {
     var s = cfg().supabase || {};
-    return { url: String(s.url || '').replace(/\/+$/, ''), key: s.anonKey || '', table: s.table || 'ai_personality_responses' };
+    return {
+      url: String(s.url || '').replace(/\/+$/, ''),
+      key: s.anonKey || '',
+      table: s.table || 'ai_personality_responses'
+    };
   }
 
   function sbReady() {
@@ -199,41 +211,33 @@
     return !!(c.url && c.key && /^https?:\/\//.test(c.url));
   }
 
-  function supabaseRequest(pathname, options) {
-    var c = sbConf();
-    var opt = Object.assign({}, options || {});
-    opt.headers = Object.assign({
-      apikey: c.key,
-      Authorization: 'Bearer ' + (opt.token || c.key)
-    }, opt.headers || {});
-    delete opt.token;
-    return fetchWithTimeout(c.url + pathname, opt, opt.timeout || 12000).then(function (res) {
-      return res.text().then(function (text) {
-        var data = null;
-        try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
-        if (!res.ok) {
-          var msg = (data && (data.message || data.error_description || data.msg || data.hint)) || ('HTTP ' + res.status);
-          var err = new Error(msg);
-          err.status = res.status;
-          err.data = data;
-          throw err;
-        }
-        return data;
-      });
-    });
-  }
-
   function send(rec) {
     var backend = cfg().backend || 'local';
     if (backend === 'supabase') {
       if (!sbReady()) return Promise.reject(new Error('Supabase 未配置'));
       var c = sbConf();
-      return supabaseRequest('/rest/v1/' + encodeURIComponent(c.table), {
+      return fetchWithTimeout(c.url + '/rest/v1/' + encodeURIComponent(c.table), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        headers: {
+          apikey: c.key,
+          Authorization: 'Bearer ' + c.key,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal'
+        },
         body: JSON.stringify(rec)
-      }).then(function () { return true; });
+      }).then(function (res) {
+        if (!res.ok) {
+          return res.text().then(function (text) {
+            var data = null;
+            try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+            var msg = (data && (data.message || data.hint || data.error)) || ('HTTP ' + res.status);
+            throw new Error(msg);
+          });
+        }
+        return true;
+      });
     }
+
     if (backend === 'custom') {
       var cs = cfg().custom || {};
       if (!cs.endpoint) return Promise.reject(new Error('自定义接口未配置'));
@@ -247,6 +251,7 @@
         return true;
       });
     }
+
     return Promise.reject(new Error('当前是本地模式'));
   }
 
@@ -258,7 +263,7 @@
     }
     if (backend === 'supabase' && !sbReady()) {
       saveLocal(rec);
-      return Promise.resolve({ ok: false, mode: 'supabase', localBackup: true, error: 'Supabase 还没配置好（config.js 里 url / anonKey 为空）' });
+      return Promise.resolve({ ok: false, mode: 'supabase', localBackup: true, error: 'Supabase 还没配置好' });
     }
     if (backend === 'custom' && !(cfg().custom && cfg().custom.endpoint)) {
       saveLocal(rec);
@@ -273,139 +278,186 @@
     });
   }
 
-  /* --------------------------- Supabase 后台 --------------------------- */
+  /* =============================================================================
+   *  数据后台 API（仅 /admin.html 使用）
+   *  - supabase 模式：用 Supabase 邮箱账号登录，登录后才能读取/删除（RLS 限制）
+   *  - local 模式：不需要登录，直接读本机 localStorage 的记录
+   *  - custom 模式：暂不支持后台
+   * ========================================================================== */
+
+  var KEY_SESSION = 'aipt:session:v2';
 
   function session() { return readJSON(KEY_SESSION, null); }
+  function signOut() {
+    try { root.localStorage.removeItem(KEY_SESSION); } catch (e) { /* ignore */ }
+  }
 
-  function signIn(email, password) {
-    var c = sbConf();
-    if (!c.url || !c.key) return Promise.reject(new Error('请先在 config.js 填好 Supabase url 和 anonKey'));
-    return fetchWithTimeout(c.url + '/auth/v1/token?grant_type=password', {
-      method: 'POST',
-      headers: { apikey: c.key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: email, password: password })
-    }, 12000).then(function (res) {
+  function requestJSON(url, options, timeout) {
+    return fetchWithTimeout(url, options || {}, timeout || 15000).then(function (res) {
       return res.text().then(function (text) {
         var data = null;
-        try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
         if (!res.ok) {
-          var m = (data && (data.error_description || data.message || data.msg || data.error)) || ('HTTP ' + res.status);
-          var err = new Error(m);
+          var msg = (data && (data.message || data.error_description || data.msg || data.hint || data.error)) ||
+            ('HTTP ' + res.status);
+          var err = new Error(String(msg));
           err.status = res.status;
-          err.code = (data && (data.error_code || data.code)) || '';
-          err.raw = data;
+          err.data = data;
           throw err;
         }
-        var s = {
-          access_token: data.access_token,
-          refresh_token: data.refresh_token,
-          expires_at: Date.now() + (data.expires_in || 3600) * 1000,
-          email: (data.user && data.user.email) || email
-        };
-        writeJSON(KEY_SESSION, s);
-        return s;
+        return data;
       });
     });
   }
 
-  function refresh() {
+  function signIn(email, password) {
+    if ((cfg().backend || 'local') !== 'supabase') {
+      return Promise.reject(new Error('当前不是 Supabase 模式，不需要登录'));
+    }
+    var c = sbConf();
+    if (!c.url || !c.key) return Promise.reject(new Error('config.js 里的 Supabase URL / anon key 没有配置完整'));
+    return requestJSON(c.url + '/auth/v1/token?grant_type=password', {
+      method: 'POST',
+      headers: { apikey: c.key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: String(email || '').trim(), password: String(password || '') })
+    }).then(function (data) {
+      if (!data || !data.access_token) throw new Error('登录失败：没有拿到访问令牌');
+      var s = {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_at: Date.now() + (Number(data.expires_in) || 3600) * 1000,
+        email: (data.user && data.user.email) || String(email || '').trim()
+      };
+      writeJSON(KEY_SESSION, s);
+      return s;
+    }, function (err) {
+      var msg = err && err.message ? err.message : '登录失败';
+      if (/invalid login credentials/i.test(msg)) msg = '邮箱或密码不正确';
+      else if (/email not confirmed/i.test(msg)) msg = '邮箱还没确认：去 Supabase → Authentication → Users 手动确认该账号';
+      else if (/failed to fetch|network/i.test(msg)) msg = '连不上 Supabase，请检查网络和 config.js 里的项目地址';
+      throw new Error(msg);
+    });
+  }
+
+  function refreshSession() {
     var s = session();
     var c = sbConf();
-    if (!s || !s.refresh_token || !c.url) return Promise.reject(new Error('未登录'));
-    return fetchWithTimeout(c.url + '/auth/v1/token?grant_type=refresh_token', {
+    if (!s || !s.refresh_token || !c.url) return Promise.reject(new Error('登录已过期，请重新登录'));
+    return requestJSON(c.url + '/auth/v1/token?grant_type=refresh_token', {
       method: 'POST',
       headers: { apikey: c.key, 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: s.refresh_token })
-    }, 12000).then(function (res) {
-      return res.json().then(function (data) {
-        if (!res.ok) throw new Error((data && (data.error_description || data.message)) || '登录已过期，请重新登录');
-        var ns = {
-          access_token: data.access_token,
-          refresh_token: data.refresh_token,
-          expires_at: Date.now() + (data.expires_in || 3600) * 1000,
-          email: (data.user && data.user.email) || s.email
-        };
-        writeJSON(KEY_SESSION, ns);
-        return ns;
-      });
+    }).then(function (data) {
+      if (!data || !data.access_token) throw new Error('登录已过期，请重新登录');
+      var ns = {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token || s.refresh_token,
+        expires_at: Date.now() + (Number(data.expires_in) || 3600) * 1000,
+        email: (data.user && data.user.email) || s.email
+      };
+      writeJSON(KEY_SESSION, ns);
+      return ns;
+    }, function () {
+      signOut();
+      throw new Error('登录已过期，请重新登录');
     });
-  }
-
-  function signOut() {
-    try { root.localStorage.removeItem(KEY_SESSION); } catch (e) { /* ignore */ }
   }
 
   function validToken() {
     var s = session();
     if (!s) return Promise.resolve(null);
     if (s.expires_at && s.expires_at - 60000 > Date.now()) return Promise.resolve(s.access_token);
-    return refresh().then(function (ns) { return ns.access_token; },
-      function () { signOut(); return null; });
+    return refreshSession().then(function (ns) { return ns.access_token; }, function () { return null; });
   }
 
-  function query(pathname, opts) {
+  function filterLocalRows(rows, opts) {
+    var out = (rows || []).filter(function (r) {
+      if (opts.version && r.survey_version !== opts.version) return false;
+      if (opts.code && r.result_code !== opts.code) return false;
+      if (opts.from && String(r.created_at || '') < String(opts.from)) return false;
+      if (opts.to && String(r.created_at || '') > String(opts.to)) return false;
+      return true;
+    });
+    out.sort(function (a, b) { return String(b.created_at || '').localeCompare(String(a.created_at || '')); });
+    return out;
+  }
+
+  function adminFetchRows(opts) {
+    opts = opts || {};
+    var backend = cfg().backend || 'local';
+    var limit = Math.max(1, Math.min(5000, Number(opts.limit) || 1000));
+
+    if (backend === 'local') {
+      return Promise.resolve(filterLocalRows(listLocal(), opts).slice(0, limit));
+    }
+    if (backend !== 'supabase') {
+      return Promise.reject(new Error('当前是自定义接口模式，这个数据后台只支持 Supabase 或本地模式'));
+    }
+    if (!sbReady()) {
+      return Promise.reject(new Error('config.js 里的 Supabase URL / anon key 没有配置完整'));
+    }
     return validToken().then(function (token) {
-      if (!token) throw new Error('UNAUTH');
-      return supabaseRequest(pathname, Object.assign({ token: token }, opts || {}));
+      if (!token) {
+        var e = new Error('登录已过期，请重新登录');
+        e.code = 'UNAUTH';
+        throw e;
+      }
+      var c = sbConf();
+      var qs = ['select=*', 'order=created_at.desc', 'limit=' + limit];
+      if (opts.version) qs.push('survey_version=eq.' + encodeURIComponent(opts.version));
+      if (opts.code) qs.push('result_code=eq.' + encodeURIComponent(opts.code));
+      if (opts.from) qs.push('created_at=gte.' + encodeURIComponent(opts.from));
+      if (opts.to) qs.push('created_at=lte.' + encodeURIComponent(opts.to));
+      return requestJSON(c.url + '/rest/v1/' + encodeURIComponent(c.table) + '?' + qs.join('&'), {
+        headers: { apikey: c.key, Authorization: 'Bearer ' + token },
+        timeout: 20000
+      }).then(function (data) {
+        return Array.isArray(data) ? data : [];
+      }, function (err) {
+        if (err && (err.status === 401 || err.status === 403)) {
+          signOut();
+          var e2 = new Error(err.status === 403
+            ? '当前账号没有读取权限（检查 Supabase RLS 是否给 authenticated 开了 select）'
+            : '登录已过期，请重新登录');
+          e2.code = 'UNAUTH';
+          throw e2;
+        }
+        throw err;
+      });
     });
   }
 
-  function fetchRows(opts) {
-    opts = opts || {};
-    var c = sbConf();
-    var qs = ['select=*', 'order=created_at.desc', 'limit=' + (opts.limit || 1000)];
-    if (opts.from) qs.push('created_at=gte.' + encodeURIComponent(opts.from));
-    if (opts.to) qs.push('created_at=lte.' + encodeURIComponent(opts.to));
-    if (opts.code) qs.push('result_code=eq.' + encodeURIComponent(opts.code));
-    return query('/rest/v1/' + encodeURIComponent(c.table) + '?' + qs.join('&'));
-  }
-
-  function remove(id) {
+  function adminRemove(id) {
+    var backend = cfg().backend || 'local';
+    if (backend === 'local') {
+      deleteLocal(id);
+      return Promise.resolve(true);
+    }
+    if (backend !== 'supabase') {
+      return Promise.reject(new Error('当前是自定义接口模式，后台不支持删除'));
+    }
     var c = sbConf();
     return validToken().then(function (token) {
-      if (!token) throw new Error('UNAUTH');
+      if (!token) {
+        var e = new Error('登录已过期，请重新登录');
+        e.code = 'UNAUTH';
+        throw e;
+      }
       return fetchWithTimeout(c.url + '/rest/v1/' + encodeURIComponent(c.table) + '?id=eq.' + encodeURIComponent(id), {
         method: 'DELETE',
         headers: { apikey: c.key, Authorization: 'Bearer ' + token, Prefer: 'return=minimal' }
-      }, 12000);
-    }).then(function (res) {
-      if (!res.ok) throw new Error('删除失败 HTTP ' + res.status);
-      return true;
+      }, 15000).then(function (res) {
+        if (res.status === 401 || res.status === 403) {
+          signOut();
+          var e2 = new Error('登录已过期或无删除权限，请重新登录');
+          e2.code = 'UNAUTH';
+          throw e2;
+        }
+        if (!res.ok) throw new Error('删除失败：HTTP ' + res.status);
+        return true;
+      });
     });
   }
-
-  /* --------------------------- 自定义接口后台 --------------------------- */
-
-  function customAdminFetch(opts) {
-    var cs = cfg().custom || {};
-    if (!cs.adminUrl) return Promise.reject(new Error('未配置 custom.adminUrl'));
-    var url = cs.adminUrl + (cs.adminUrl.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(cs.adminToken || '');
-    return fetchWithTimeout(url, { method: 'GET', headers: cs.headers || {} }, 15000).then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res.json();
-    }).then(function (data) {
-      if (Array.isArray(data)) return data;
-      if (data && Array.isArray(data.rows)) return data.rows;
-      if (data && Array.isArray(data.data)) return data.data;
-      throw new Error('接口返回格式不认识（应为数组或 {rows: [...]}）');
-    });
-  }
-
-  var admin = {
-    fetchRows: function (opts) {
-      var backend = cfg().backend || 'local';
-      if (backend === 'supabase') return fetchRows(opts);
-      if (backend === 'custom') return customAdminFetch(opts);
-      return Promise.resolve(listLocal());
-    },
-    remove: function (id) {
-      var backend = cfg().backend || 'local';
-      if (backend === 'supabase') return remove(id);
-      deleteLocal(id);
-      return Promise.resolve(true);
-    },
-    isRemote: function () { return (cfg().backend || 'local') !== 'local'; }
-  };
 
   /* ------------------------------ CSV 导出 ------------------------------ */
 
@@ -421,47 +473,69 @@
     var d = new Date(isoStr);
     if (isNaN(d.getTime())) return String(isoStr);
     function p(n) { return (n < 10 ? '0' : '') + n; }
-    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+      p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
   }
 
   function toCSV(rows, survey) {
     var dims = Object.keys((survey && survey.dimensions) || {});
     var questions = (survey && survey.questions) || [];
-    var head = ['提交时间', '结果代码', '结果类型', '昵称', '用时(秒)'];
+    var head = ['提交时间', '问卷版本', '结果编号', '结果名称', '昵称', '用时(秒)', '完成题数', '总题数',
+      'profileCode', '并列候选', '是否并列', '是否全中性', '近似机体', '最佳距离', '次佳距离'];
     dims.forEach(function (k) {
       var d = survey.dimensions[k];
       head.push(d.label + '-' + d.left.name + '%');
       head.push(d.label + '-' + d.right.name + '%');
-      head.push(d.label + '-倾向');
+      head.push(d.label + '-原始分');
     });
     questions.forEach(function (q) { head.push('[' + q.id + '] ' + q.text); });
-    head = head.concat(['完成题数', '设备', '来源页', '语言', '屏幕', '时区', '问卷版本']);
+    head = head.concat(['设备', '来源页', '语言', '屏幕', '时区']);
 
     var lines = [head.map(csvCell).join(',')];
     (rows || []).forEach(function (r) {
       var detail = {};
-      (r.answer_detail || []).forEach(function (d) { detail[d.id] = d.text; });
+      (r.answer_detail || []).forEach(function (d) { if (d && d.id) detail[d.id] = d.text; });
       if (!Object.keys(detail).length && r.answers) {
         Object.keys(r.answers).forEach(function (qid) {
           var q = questions.filter(function (x) { return x.id === qid; })[0];
-          if (q && q.options[r.answers[qid]]) detail[qid] = q.options[r.answers[qid]].text;
+          if (q && q.options && q.options[r.answers[qid]]) detail[qid] = q.options[r.answers[qid]].text;
         });
       }
-      var row = [localTime(r.created_at), r.result_code, r.result_name, r.nickname || '',
-        r.duration_ms ? Math.round(r.duration_ms / 1000) : ''];
+      var m = (r.percents && r.percents.match) || {};
+      var row = [
+        localTime(r.created_at), r.survey_version || '', r.result_code || '', r.result_name || '',
+        r.nickname || '', r.duration_ms ? Math.round(r.duration_ms / 1000) : '',
+        r.answered === undefined ? '' : r.answered, r.total === undefined ? '' : r.total,
+        m.profileCode || '', (m.candidates || []).join(' / '),
+        m.tie ? '是' : '否', m.allNeutral ? '是' : '否',
+        (m.near || []).join(' / '),
+        m.bestDistance === undefined ? '' : m.bestDistance,
+        m.secondDistance === undefined ? '' : m.secondDistance
+      ];
       dims.forEach(function (k) {
         var p = (r.percents || {})[k] || {};
         row.push(p.left === undefined ? '' : p.left);
         row.push(p.right === undefined ? '' : p.right);
-        row.push(p.pole === 'left' ? p.leftName : (p.pole === 'right' ? p.rightName : ''));
+        row.push((r.scores || {})[k] === undefined ? '' : (r.scores || {})[k]);
       });
       questions.forEach(function (q) { row.push(detail[q.id] || ''); });
-      row = row.concat([(r.answered || '') + '/' + (r.total || ''), r.user_agent || '', r.referrer || '',
-        r.lang || '', r.screen || '', r.timezone || '', r.survey_version || '']);
+      row = row.concat([r.user_agent || '', r.referrer || '', r.lang || '', r.screen || '', r.timezone || '']);
       lines.push(row.map(csvCell).join(','));
     });
     return '\ufeff' + lines.join('\r\n');
   }
+
+  var admin = {
+    dataSource: function () { return cfg().backend || 'local'; },
+    isRemote: function () { return (cfg().backend || 'local') !== 'local'; },
+    ready: sbReady,
+    session: session,
+    signIn: signIn,
+    signOut: signOut,
+    validToken: validToken,
+    fetchRows: adminFetchRows,
+    remove: adminRemove
+  };
 
   var Store = {
     uid: uid,
@@ -473,12 +547,9 @@
     pendingCount: pendingCount,
     listLocal: listLocal,
     saveLocal: saveLocal,
-    deleteLocal: deleteLocal,
     clearLocal: clearLocal,
-    importRows: importRows,
     toCSV: toCSV,
     localTime: localTime,
-    supabase: { signIn: signIn, signOut: signOut, session: session, ready: sbReady, validToken: validToken },
     admin: admin,
     backend: function () { return cfg().backend || 'local'; }
   };

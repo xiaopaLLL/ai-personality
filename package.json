@@ -1,15 +1,14 @@
 {
-  "name": "ai-personality-test",
-  "version": "1.0.0",
+  "name": "ai-collab-machine-test",
+  "version": "2.0.0",
   "private": true,
-  "description": "AI 人格测试：纯静态问卷网站 + 数据后台（GitHub Pages + Supabase 可直接部署）",
+  "description": "AI 协作机体测试：纯静态 16 题问卷 + 8 种协作机体结果（GitHub Pages + Supabase）",
   "scripts": {
-    "test": "node tests/engine.test.mjs && node tests/smoke.mjs && node tests/e2e.mjs && node tests/e2e-supabase.mjs",
+    "test": "node tests/engine.test.mjs && node tests/smoke.mjs && node tests/e2e.mjs && node tests/admin-e2e.mjs",
     "test:unit": "node tests/engine.test.mjs",
     "test:smoke": "node tests/smoke.mjs",
     "test:e2e": "node tests/e2e.mjs",
-    "test:supabase": "node tests/e2e-supabase.mjs",
-    "check": "node tests/check-supabase.mjs",
+    "test:admin": "node tests/admin-e2e.mjs",
     "serve": "node tests/serve.mjs 8000",
     "shots": "node tests/screenshots.mjs"
   },

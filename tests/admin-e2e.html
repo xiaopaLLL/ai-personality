@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>E2E · 数据后台（local 模式）</title>
+<style>
+  body { background:#07100b; color:#e9eedf; font-family: Consolas, monospace; margin:0; padding:12px; }
+  #log { white-space: pre-wrap; font-size: 13px; line-height: 1.55; margin: 0 0 14px; }
+  iframe { width: 1200px; height: 900px; border: 1px solid #24331f; }
+  .bad { color:#fb7185 }
+</style>
+</head>
+<body>
+<pre id="log">running…</pre>
+<script>
+var lines = [];
+function log(s) {
+  lines.push(s);
+  var el = document.getElementById('log');
+  el.textContent = lines.join('\n');
+  if (s.indexOf('FAIL') >= 0) el.className = 'bad';
+}
+function check(name, cond, extra) {
+  log((cond ? 'RESULT PASS ' : 'RESULT FAIL ') + name + (cond ? '' : '  ← ' + (extra === undefined ? 'false' : extra)));
+}
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+function waitFor(fn, timeout, interval) {
+  timeout = timeout || 12000; interval = interval || 60;
+  var t0 = Date.now();
+  return new Promise(function (resolve, reject) {
+    (function tick() {
+      var v;
+      try { v = fn(); } catch (e) { v = null; }
+      if (v) return resolve(v);
+      if (Date.now() - t0 > timeout) return reject(new Error('等待超时'));
+      setTimeout(tick, interval);
+    })();
+  });
+}
+
+/* ---------------- 造 4 条本地记录（3 条新版 + 1 条旧版） ---------------- */
+function fullAnswers() {
+  var a = {};
+  for (var i = 1; i <= 16; i++) a['q' + (i < 10 ? '0' : '') + i] = 0;
+  return a;
+}
+function newRecord(id, code, name, createdAt, nickname, tie) {
+  return {
+    id: id,
+    created_at: createdAt,
+    survey_id: 'ai-collab-machine',
+    survey_version: 'v2.0',
+    result_code: code,
+    result_name: name,
+    scores: { drive: 7, heart: 6, order: 3, role: 2 },
+    percents: {
+      drive: { left: 94, right: 6, leftName: '探索派', rightName: '交付派', pole: 'left', raw: 7 },
+      heart: { left: 88, right: 12, leftName: '共情派', rightName: '逻辑派', pole: 'left', raw: 6 },
+      order: { left: 69, right: 31, leftName: '结构派', rightName: '灵感派', pole: 'left', raw: 3 },
+      role: { left: 63, right: 37, leftName: '主导派', rightName: '副驾派', pole: 'left', raw: 2 },
+      match: {
+        profileCode: 'EWSP', display: code,
+        candidates: tie ? ['M01', 'M02'] : [code],
+        tie: !!tie, allNeutral: false, near: [],
+        bestDistance: 0.0078, secondDistance: tie ? 0.0078 : 0.125
+      }
+    },
+    answers: fullAnswers(),
+    answer_detail: [],
+    answered: 16,
+    total: 16,
+    duration_ms: 45000,
+    nickname: nickname || '',
+    user_agent: 'Mozilla/5.0 (E2E-Test)',
+    referrer: '',
+    lang: 'zh-CN',
+    screen: '390x844',
+    timezone: 'Asia/Shanghai'
+  };
+}
+function oldRecord(id, createdAt) {
+  return {
+    id: id,
+    created_at: createdAt,
+    survey_id: 'ai-personality',
+    survey_version: 'v1.0',
+    result_code: 'EWSP',
+    result_name: '提示词总导演',
+    scores: { drive: 7, heart: 4, order: -3, role: 2 },
+    percents: {
+      drive: { left: 73, right: 27, leftName: '探索派', rightName: '交付派', pole: 'left' },
+      heart: { left: 64, right: 36, leftName: '共情派', rightName: '逻辑派', pole: 'left' },
+      order: { left: 38, right: 62, leftName: '结构派', rightName: '灵感派', pole: 'right' },
+      role: { left: 58, right: 42, leftName: '主导派', rightName: '副驾派', pole: 'left' }
+    },
+    answers: {},
+    answer_detail: [],
+    answered: 16,
+    total: 16,
+    duration_ms: 62000,
+    nickname: '旧版用户',
+    user_agent: 'Mozilla/5.0 (E2E-Test)',
+    lang: 'zh-CN',
+    screen: '1440x900',
+    timezone: 'Asia/Shanghai'
+  };
+}
+
+var now = Date.now();
+function todayAt(hour, minute) {
+  var d = new Date();
+  d.setHours(hour, minute, 0, 0);
+  return d.toISOString();
+}
+var rec1 = newRecord('rec-1', 'M01', '机魂总调度', todayAt(0, 10), '测试甲', false);
+var rec2 = newRecord('rec-2', 'M02', '霓虹树洞', todayAt(0, 20),
+  '<img src=x onerror="window.__adminXss=1">', true);
+var rec3 = newRecord('rec-3', 'M03', '数据潜航员', new Date(now - 2 * 24 * 3600 * 1000).toISOString(), '<b>坏昵称</b>', false);
+rec3.answered = 15;
+delete rec3.answers.q16;
+var old = oldRecord('rec-old', new Date(now - 3 * 24 * 3600 * 1000).toISOString());
+old.answers = { q01: 2, q05: 0 };
+old.answer_detail = [
+  { id: 'q01', index: 2, text: '旧版答案文本 A <img src=x onerror="window.__adminXss=2">', scores: { drive: 2 } },
+  { id: 'q05', index: 0, text: '旧版答案文本 B', scores: { heart: 2 } }
+];
+var seed = [rec1, rec2, rec3, old];
+localStorage.setItem('aipt:local:v2', JSON.stringify(seed));
+
+var f = document.createElement('iframe');
+f.id = 'adminFrame';
+f.src = '../admin.html';
+document.body.appendChild(f);
+
+var failures = 0;
+f.addEventListener('load', function () { run(); });
+
+async function run() {
+  try {
+    var w = f.contentWindow;
+    var d = f.contentDocument;
+    await waitFor(function () {
+      return d.getElementById('viewDash') && d.getElementById('viewDash').hidden === false &&
+        d.querySelectorAll('#tableBody tr').length > 0;
+    });
+
+    check('local 模式直接进入看板', d.getElementById('viewDash').hidden === false);
+    check('登录视图隐藏', d.getElementById('viewLogin').hidden === true);
+    var banner = d.getElementById('modeBanner');
+    check('顶部显示本地模式提示', banner && banner.hidden === false && /本地模式/.test(banner.textContent), banner && banner.textContent);
+    check('本地模式隐藏退出登录按钮', d.getElementById('logoutBtn').hidden === true);
+
+    /* ---------- 状态条 / KPI ---------- */
+    check('状态条显示问卷版本 v2.0', /v2\.0/.test(d.getElementById('statusVersion').textContent),
+      d.getElementById('statusVersion').textContent);
+    check('状态条载入 4 条记录', /4/.test(d.getElementById('statusCount').textContent),
+      d.getElementById('statusCount').textContent);
+    var cards = d.querySelectorAll('#kpis .adm-kpi');
+    check('KPI 共 6 张', cards.length === 6, cards.length);
+    function kpiValue(label) {
+      for (var i = 0; i < cards.length; i++) {
+        var lb = cards[i].querySelector('.adm-kpi-label');
+        if (lb && lb.textContent.replace(/\s+/g, '') === label) {
+          var v = cards[i].querySelector('.adm-kpi-value');
+          return v ? v.textContent.trim() : '';
+        }
+      }
+      return '';
+    }
+    check('总答卷 KPI = 3（默认只看新版）', kpiValue('总答卷') === '3', kpiValue('总答卷'));
+    check('今日新增 KPI = 2', kpiValue('今日新增') === '2', kpiValue('今日新增'));
+    check('并列答卷数 KPI = 1', kpiValue('并列答卷数') === '1', kpiValue('并列答卷数'));
+
+    /* ---------- 图表 ---------- */
+    check('8 机体分布渲染 8 行', d.querySelectorAll('#typeChart .adm-dist-row').length === 8,
+      d.querySelectorAll('#typeChart .adm-dist-row').length);
+    check('分布图包含机体中文名', /机魂总调度/.test(d.getElementById('typeChart').textContent));
+    check('四维平均渲染 4 块', d.querySelectorAll('#dimChart .adm-dim').length === 4,
+      d.querySelectorAll('#dimChart .adm-dim').length);
+    check('16 题选项分布渲染 16 题', d.querySelectorAll('#questionStats .adm-q').length === 16,
+      d.querySelectorAll('#questionStats .adm-q').length);
+    check('14 天趋势渲染 14 根柱', d.querySelectorAll('#trendChart .adm-trend-col').length === 14,
+      d.querySelectorAll('#trendChart .adm-trend-col').length);
+    check('筛选器：机体选项 = 全部 + 8 机体', d.getElementById('filterType').options.length === 9,
+      d.getElementById('filterType').options.length);
+
+    /* ---------- 表格 / 安全 ---------- */
+    check('默认表格显示 3 条新版记录', d.querySelectorAll('#tableBody tr').length === 3,
+      d.querySelectorAll('#tableBody tr').length);
+    check('表格显示中文机体名', /机魂总调度/.test(d.getElementById('tableBody').textContent));
+    check('表格显示并列标记', /并列/.test(d.getElementById('tableBody').textContent));
+    check('XSS 昵称被转义为文本', d.querySelectorAll('#tableBody img').length === 0 && !w.__adminXss,
+      'img=' + d.querySelectorAll('#tableBody img').length + ' xss=' + w.__adminXss);
+    check('导出按钮存在', !!d.getElementById('exportCsv') && !!d.getElementById('exportJson'));
+
+    /* ---------- 筛选 ---------- */
+    var vsel = d.getElementById('filterVersion');
+    vsel.value = 'all';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 4; });
+    check('版本筛选切到全部后显示 4 条', d.querySelectorAll('#tableBody tr').length === 4);
+    check('旧版记录以旧类型代码展示', /EWSP|提示词总导演/.test(d.getElementById('tableBody').textContent));
+
+    vsel.value = 'new';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 3; });
+
+    var tsel = d.getElementById('filterType');
+    tsel.value = 'M01';
+    tsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 1; });
+    check('机体筛选 M01 后只显示 1 条', d.querySelectorAll('#tableBody tr').length === 1);
+    tsel.value = '';
+    tsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 3; });
+
+    /* ---------- 单份答卷详情 ---------- */
+    function viewButton(id) {
+      return d.querySelector('#tableBody tr[data-id="' + id + '"] button[data-view]');
+    }
+    function modal() { return d.getElementById('detailModal'); }
+
+    var view1 = viewButton('rec-1');
+    check('表格每行有「查看」按钮', !!view1);
+    view1.click();
+    await waitFor(function () {
+      return modal().hidden === false && d.querySelectorAll('#detailAnswers .adm-detail-q').length === 16;
+    });
+    check('查看弹层打开', modal().hidden === false);
+    check('弹层标题含机体名与内部编号',
+      /机魂总调度/.test(d.getElementById('detailTitle').textContent) &&
+      /M01/.test(d.getElementById('detailTitle').textContent),
+      d.getElementById('detailTitle').textContent);
+    check('弹层元信息含昵称 / 版本 / 用时',
+      /测试甲/.test(d.getElementById('detailMeta').textContent) &&
+      /v2\.0/.test(d.getElementById('detailMeta').textContent) &&
+      /45/.test(d.getElementById('detailMeta').textContent));
+    check('四维详情渲染 4 块', d.querySelectorAll('#detailDims .adm-detail-dim').length === 4,
+      d.querySelectorAll('#detailDims .adm-detail-dim').length);
+    check('逐题答案渲染 16 题', d.querySelectorAll('#detailAnswers .adm-detail-q').length === 16,
+      d.querySelectorAll('#detailAnswers .adm-detail-q').length);
+    check('每题恰好一个选中项', d.querySelectorAll('#detailAnswers .adm-detail-option.is-selected').length === 16,
+      d.querySelectorAll('#detailAnswers .adm-detail-option.is-selected').length);
+    check('选中项带「所选」标记', /所选/.test(d.getElementById('detailAnswers').textContent));
+    check('打开弹层时锁定页面滚动', w.document.body.classList.contains('adm-modal-open'));
+
+    d.getElementById('detailCopy').click();
+    await waitFor(function () {
+      var msg = d.getElementById('detailCopyMsg');
+      return msg && msg.hidden === false && msg.textContent.trim().length > 0;
+    });
+    check('复制该答卷 JSON 有反馈', /复制/.test(d.getElementById('detailCopyMsg').textContent),
+      d.getElementById('detailCopyMsg').textContent);
+
+    d.getElementById('detailClose').click();
+    await waitFor(function () { return modal().hidden === true; });
+    check('关闭按钮可关闭弹层', modal().hidden === true);
+    check('关闭后焦点回到查看按钮', d.activeElement === view1);
+    check('关闭后解除滚动锁', !w.document.body.classList.contains('adm-modal-open'));
+
+    /* XSS 昵称不得在弹层里变成 HTML */
+    viewButton('rec-2').click();
+    await waitFor(function () { return modal().hidden === false; });
+    check('弹层不解析 XSS 昵称', d.querySelectorAll('#detailModal img').length === 0 && !w.__adminXss);
+    d.getElementById('detailClose').click();
+    await waitFor(function () { return modal().hidden === true; });
+
+    /* 缺题记录 */
+    viewButton('rec-3').click();
+    await waitFor(function () {
+      return modal().hidden === false && d.querySelectorAll('#detailAnswers .adm-detail-q').length === 16;
+    });
+    check('缺题记录显示「未作答」', d.querySelectorAll('#detailAnswers .adm-detail-missing').length >= 1,
+      d.querySelectorAll('#detailAnswers .adm-detail-missing').length);
+    check('缺题记录元信息显示 15 / 16', /15\s*\/\s*16/.test(d.getElementById('detailMeta').textContent),
+      d.getElementById('detailMeta').textContent.replace(/\s+/g, ' ').slice(0, 80));
+    d.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await waitFor(function () { return modal().hidden === true; });
+    check('ESC 可关闭弹层', modal().hidden === true);
+
+    /* 旧版记录：走 answer_detail 文本 */
+    vsel.value = 'all';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 4; });
+    viewButton('rec-old').click();
+    await waitFor(function () { return modal().hidden === false; });
+    check('旧版记录渲染 answer_detail 条目', d.querySelectorAll('#detailAnswers .adm-detail-old-item').length === 2,
+      d.querySelectorAll('#detailAnswers .adm-detail-old-item').length);
+    check('旧版记录有题目文本差异提示',
+      d.getElementById('detailAnswersNote').hidden === false &&
+      /旧版/.test(d.getElementById('detailAnswersNote').textContent));
+    check('旧版弹层不显示匹配元数据', !/profileCode/i.test(d.getElementById('detailMeta').textContent));
+    check('旧版答案文本中的 XSS 未执行', !w.__adminXss && d.querySelectorAll('#detailModal img').length === 0);
+    d.getElementById('detailBackdrop').click();
+    await waitFor(function () { return modal().hidden === true; });
+    check('点击遮罩可关闭弹层', modal().hidden === true);
+    vsel.value = 'new';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 3; });
+
+    /* ---------- 删除 ---------- */
+    w.confirm = function () { return true; };
+    var beforeLocal = JSON.parse(localStorage.getItem('aipt:local:v2') || '[]').length;
+    var del = d.querySelector('#tableBody button[data-del]');
+    check('表格有删除按钮', !!del);
+    del.click();
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 2; });
+    var afterLocal = JSON.parse(localStorage.getItem('aipt:local:v2') || '[]').length;
+    check('删除后表格剩 2 条', d.querySelectorAll('#tableBody tr').length === 2);
+    check('删除后本地存储减少 1 条', afterLocal === beforeLocal - 1, beforeLocal + '→' + afterLocal);
+
+    var passed = lines.filter(function (s) { return s.indexOf('RESULT PASS') === 0; }).length;
+    var failed = lines.filter(function (s) { return s.indexOf('RESULT FAIL') === 0; }).length;
+    log('SUMMARY passed=' + passed + ' failed=' + failed);
+  } catch (e) {
+    check('后台 E2E 总流程', false, e && e.message);
+    log('SUMMARY passed=0 failed=1');
+  }
+}
+</script>
+</body>
+</html>

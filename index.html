@@ -3,103 +3,166 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>AI 人格测试 · 16 道题测出你的人机协作人格</title>
-<meta name="description" content="16 道选择题，测出你在人机协作里的 AI 人格类型。共 16 种人格，附优势、盲点与使用建议。">
-<meta name="theme-color" content="#070716">
+<title>AI 协作机体测试 · 16 道情境题，接入你的协作机体</title>
+<meta name="description" content="16 道日常 AI 使用情境，从 4 个维度接入你的协作风格，匹配 8 种协作机体。约 3 分钟，结果仅供趣味参考。">
+<meta name="theme-color" content="#07100b">
+<meta name="color-scheme" content="dark">
 <meta property="og:type" content="website">
-<meta property="og:title" content="AI 人格测试">
-<meta property="og:description" content="16 道题，测出你在人机协作里的真实人格。">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>🧠</text></svg>">
-<link rel="stylesheet" href="assets/css/style.css">
+<meta property="og:title" content="AI 协作机体测试">
+<meta property="og:description" content="16 道题测出你的协作方式：8 种协作机体，4 个维度，附偏好、边界与尝试建议。">
+<meta property="og:site_name" content="AI 协作机体测试">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2307100b'/%3E%3Crect x='7.5' y='7.5' width='17' height='17' fill='none' stroke='%23d9f24a' stroke-width='2'/%3E%3Cpath d='M16 3v8M16 21v8M3 16h8M21 16h8' stroke='%23d9f24a' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/css/style.css?v=2.2">
 </head>
 <body>
+
+<!-- 背景质感层：细网格 + 半调网点 + 暗角，全部由 CSS 绘制 -->
+<div class="bg-layers" aria-hidden="true">
+  <div class="bg-grid"></div>
+  <div class="bg-dots"></div>
+  <div class="bg-glow"></div>
+  <div class="bg-vignette"></div>
+</div>
+
 <div class="shell">
 
-  <div class="topbar">
-    <div class="brand"><span class="dot"></span><span id="brandName">AI 人格测试</span></div>
-    <div><span class="chip" id="backendChip">本地预览模式</span></div>
-  </div>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="回到首页">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-copy">
+        <span class="brand-name" id="brandName">AI 协作机体测试</span>
+        <span class="brand-sub mono">CO-OP UNIT DOSSIER</span>
+      </span>
+    </a>
+    <span class="topbar-meta mono" aria-hidden="true">
+      <i class="dot"></i>INTAKE / 8 UNITS
+    </span>
+  </header>
 
-  <main>
-    <!-- ============================ 首屏 ============================ -->
-    <section id="screen-intro" class="card hero">
-      <h1 id="introTitle">AI 人格测试</h1>
-      <p class="sub" id="introSub"></p>
-      <div class="meta">
-        <span class="chip" id="metaCount">16 道题</span>
-        <span class="chip" id="metaTime">约 3 分钟</span>
-        <span class="chip">16 种人格类型</span>
+  <main class="main" id="main">
+
+    <!-- ================================ 首屏 ================================ -->
+    <section id="screen-intro" class="screen" aria-labelledby="introTitle">
+
+      <div class="hero-head">
+        <p class="eyebrow mono"><span class="eyebrow-mark" aria-hidden="true"></span>接入前 / INTAKE BRIEF</p>
+        <h1 class="hero-title" id="introTitle">AI 协作机体测试</h1>
+        <p class="hero-sub" id="introSub"></p>
       </div>
 
-      <div class="intro-box" id="introText"></div>
+      <ul class="spec-bar" aria-label="测试基本信息">
+        <li><b class="mono" id="specCount">16</b><span>道情境题</span></li>
+        <li><b class="mono" id="specDims">4</b><span>个维度</span></li>
+        <li><b class="mono" id="specTypes">8</b><span>种协作机体</span></li>
+        <li><b class="mono" id="specTime">3</b><span>分钟左右</span></li>
+      </ul>
 
-      <div id="resumeBox" class="resume-box hidden">
-        <span id="resumeText"></span>
-        <span>
-          <button class="btn btn-ghost" id="resumeBtn" style="padding:6px 12px;font-size:13px">继续作答</button>
-          <button class="btn btn-ghost" id="resumeDiscard" style="padding:6px 12px;font-size:13px">不要了</button>
-        </span>
-      </div>
-
-      <div class="field" id="nicknameField">
-        <label for="nickname">昵称（可留空）</label>
-        <input class="input" id="nickname" type="text" maxlength="20" autocomplete="off" placeholder="昵称（可留空）">
-      </div>
-
-      <label class="consent" id="consentField">
-        <input type="checkbox" id="consent">
-        <span id="consentText">同意匿名记录作答数据。</span>
-      </label>
-
-      <div class="btn-row center" style="margin-top:22px">
-        <button class="btn btn-primary" id="startBtn">开始测试 →</button>
-      </div>
-
-      <details class="type-details">
-        <summary>先看看 16 种 AI 人格长什么样</summary>
-        <div class="type-grid" id="typeGrid"></div>
-      </details>
-    </section>
-
-    <!-- ============================ 答题页 ============================ -->
-    <section id="screen-quiz" class="hidden">
-      <div class="quiz-head">
-        <span id="qCounter">第 1 / 16 题</span>
-        <span id="qPct">0%</span>
-      </div>
-      <div class="progress"><i id="progressFill"></i></div>
-      <div class="card" id="qCard">
-        <div class="q-index" id="qIndex">QUESTION 01</div>
-        <h2 class="q-text" id="qText"></h2>
-        <div class="options" id="options"></div>
-        <div class="quiz-footer">
-          <button class="btn btn-ghost" id="backBtn">← 上一题</button>
-          <span class="hint-key">键盘：1 / 2 / 3 选择，← 返回</span>
+      <div class="resume-bar" id="resumeBox" hidden>
+        <div class="resume-copy">
+          <p class="mono resume-label">RESUME / 未完成档案</p>
+          <p class="resume-text" id="resumeText"></p>
+        </div>
+        <div class="resume-actions">
+          <button type="button" class="btn btn-lime btn-sm" id="resumeBtn">继续上次作答</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="resumeDiscard">重新开始</button>
         </div>
       </div>
+
+      <div class="hero-grid">
+        <div class="intro-copy">
+          <div class="intro-text" id="introText"></div>
+          <p class="intro-aside mono" id="introAside">SIGNAL CHECK · 每题三选一 · 凭第一反应作答</p>
+        </div>
+
+        <div class="intake framed">
+          <div class="intake-head">
+            <p class="mono intake-label">INTAKE FORM / 接入信息</p>
+            <span class="intake-ticks mono" aria-hidden="true">///</span>
+          </div>
+
+          <div class="field" id="nicknameField">
+            <label class="field-label mono" for="nickname">昵称 / CALLSIGN</label>
+            <input class="input" id="nickname" name="nickname" type="text" maxlength="20" autocomplete="off" placeholder="可以留空">
+          </div>
+
+          <label class="consent" id="consentField">
+            <input type="checkbox" id="consent">
+            <span class="consent-box" aria-hidden="true"></span>
+            <span class="consent-text" id="consentText">同意匿名记录作答选项与结果。</span>
+          </label>
+
+          <button type="button" class="btn btn-start" id="startBtn">
+            <span>开始接入</span><span class="btn-arrow" aria-hidden="true">→</span>
+          </button>
+          <p class="start-hint" id="startHint" role="alert" hidden></p>
+
+          <p class="intake-note mono" id="intakeNote">ANONYMOUS LOG · 仅记录选项与结果</p>
+        </div>
+      </div>
+
+      <section class="gallery" aria-labelledby="galleryTitle">
+        <div class="gallery-head">
+          <h2 class="gallery-title" id="galleryTitle">八种协作机体</h2>
+          <p class="gallery-note mono">8 CO-OP UNITS / 档案目录</p>
+        </div>
+        <div class="type-gallery" id="typeGallery"></div>
+      </section>
     </section>
 
-    <!-- ============================ 结果页 ============================ -->
-    <section id="screen-result" class="hidden"></section>
+    <!-- ================================ 答题 ================================ -->
+    <section id="screen-quiz" class="screen hidden" aria-labelledby="qText">
+      <div class="quiz-shell">
 
-    <!-- ========================= 分享落地页 ========================= -->
-    <section id="screen-shared" class="hidden"></section>
+        <div class="quiz-top">
+          <p class="mono quiz-eyebrow"><i class="dot live" aria-hidden="true"></i>SESSION / 正在接入</p>
+          <p class="mono quiz-counter" id="qCounter">第 1 / 16 题</p>
+        </div>
+
+        <div class="segments" id="segments" aria-hidden="true"></div>
+        <p class="sr-only" id="a11yStatus" aria-live="polite"></p>
+
+        <div class="q-card framed" id="qCard">
+          <div class="q-meta">
+            <span class="mono q-index" id="qIndex">Q.01</span>
+            <span class="mono q-dim" id="qDimLabel">驱动方式</span>
+          </div>
+          <h2 class="q-text" id="qText" tabindex="-1"></h2>
+          <div class="options" id="options" role="group" aria-labelledby="qText"></div>
+          <div class="quiz-foot">
+            <button type="button" class="btn btn-ghost btn-sm" id="backBtn">← 上一题</button>
+            <p class="kbd-hint mono"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> 选择 · <kbd>←</kbd> 返回 · <kbd>→</kbd> 下一题</p>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ================================ 结果 ================================ -->
+    <section id="screen-result" class="screen hidden" aria-label="测试结果">
+      <div id="resultRoot"></div>
+    </section>
+
+    <!-- ============================== 分享落地页 ============================== -->
+    <section id="screen-shared" class="screen hidden" aria-label="分享的机体档案">
+      <div id="sharedRoot"></div>
+    </section>
+
   </main>
 
   <footer class="site-footer">
-    <div id="footerNote"></div>
-    <div style="margin-top:6px" id="footerLinks">
-      <a href="admin.html">数据后台</a>
-    </div>
+    <p class="footer-note" id="footerNote"></p>
+    <p class="footer-brand mono">AI 协作机体测试</p>
   </footer>
+
 </div>
 
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-<script src="config.js"></script>
-<script src="assets/js/questions.js"></script>
-<script src="assets/js/personality.js"></script>
-<script src="assets/js/store.js"></script>
-<script src="assets/js/app.js"></script>
+<!-- scripts: config → 题库 → 引擎 → 数据层 → 前台交互；全部带版本参数便于绕过缓存 -->
+<script src="config.js?v=2.2"></script>
+<script src="assets/js/questions.js?v=2.2"></script>
+<script src="assets/js/personality.js?v=2.2"></script>
+<script src="assets/js/store.js?v=2.2"></script>
+<script src="assets/js/app.js?v=2.2"></script>
 </body>
 </html>

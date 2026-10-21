@@ -1,0 +1,27 @@
+# ---- 问卷原始素材：只保留在本地，不发布到 GitHub Pages ----
+resources/
+
+# ---- 系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# ---- 依赖 / 日志 ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# ---- 本地环境变量 / 私密配置 ----
+.env
+.env.*
+*.local
+
+# ---- 测试与预览产物 ----
+tests/screenshots/
+tests/ui-*.png
+tests/admin-*.png
+tests/preview-*.png

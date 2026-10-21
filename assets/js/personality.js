@@ -1,158 +1,258 @@
 /* =============================================================================
- *  计分引擎 + 16 型人格库
+ *  AI 协作机体测试 · 计分与匹配引擎
  * =============================================================================
- *  这个文件一般不需要改。改题型请改 questions.js。
- *  Engine 是纯函数集合，可以在浏览器和 Node 里直接用（方便跑测试）。
+ *  规则与 resources/新题目与计分说明.md 一致：
+ *
+ *  1. 四维原始分 s 的范围均为 -8 ~ +8，归一化坐标 x = s / 8。
+ *  2. 左侧展示 = round(50 + 50x)，右侧 = 100 - 左侧；0 分固定显示 50:50，
+ *     不把中性悄悄归到某一端。
+ *  3. 八种机体是四维空间里的八个原型，用同样的距离权重找最近的：
+ *        D = ((x1-p1)^2 + (x2-p2)^2 + (x3-p3)^2 + (x4-p4)^2) / 4
+ *     距离相同 → 全部保留为并列候选；最佳与次佳差 ≤ 1/16 → 提示“同时接近”。
+ *  4. profileCode 只是给数据留存用的四维方向（E/D、W/L、S/I、P/C，中性为 X），
+ *     不参与机体编号，也不在前端展示。
+ *  5. 机体编号 M01-M08 只是类别标识，前端只显示机体名。
+ *
+ *  纯函数实现，浏览器与 Node 测试可共用。
  * ========================================================================== */
 
 (function (root) {
   'use strict';
 
   var DIM_ORDER = ['drive', 'heart', 'order', 'role'];
+  var NEAR_THRESHOLD = 1 / 16;
+  var TYPE_COUNT = 8;
 
-  /* ------------------------- 16 型人格内容库 ------------------------- */
-  var TYPES = {
-    EWSP: {
-      name: '提示词总导演', emoji: '🎬',
-      tagline: '用自己的一套方法，把 AI 带去没人去过的地方',
-      desc: '你既想要新可能，也相信方法。你会先跟 AI 把话说清、把感觉对齐，再用自己那套流程把它推向一个新方向。团队里「试得最早、讲得最明白」的那个人，通常是你。',
-      strengths: ['能把模糊灵感变成可复用的提示词流程', '对 AI 的语气和情绪敏感，产出有「人味」', '敢第一个跳进去试，也愿意回头总结方法'],
-      watch: ['同时开太多新方向，收尾常得靠别人', '对流程的讲究有时拖慢了野蛮生长的速度'],
-      tips: ['给每个新想法设一个「48 小时内判断去留」的关卡', '把你的提示词模板沉淀成团队共享资产', '每周留一次不带目的的乱试时间']
+  /* ------------------------------ 八个原型坐标 ------------------------------ */
+  /* 顺序固定：drive / heart / order / role；八个原型等范数，并组成四对相反画像。 */
+  var PROTOTYPES = [
+    { id: 'M01', slug: 'machine-soul',    coord: { drive: 1,     heart: 0.75,  order: 0.5,    role: 0.25  } },
+    { id: 'M02', slug: 'neon-hollow',     coord: { drive: 0.5,   heart: 0.25,  order: -1,     role: -0.75 } },
+    { id: 'M03', slug: 'data-diver',      coord: { drive: 0.25,  heart: -0.5,  order: 0.75,   role: -1    } },
+    { id: 'M04', slug: 'module-breaker',  coord: { drive: 0.75,  heart: -1,    order: -0.25,  role: 0.5   } },
+    { id: 'M05', slug: 'channel-tuner',   coord: { drive: -0.75, heart: 1,     order: 0.25,   role: -0.5  } },
+    { id: 'M06', slug: 'ddl-navigator',   coord: { drive: -0.25, heart: 0.5,   order: -0.75,  role: 1     } },
+    { id: 'M07', slug: 'protocol-forger', coord: { drive: -0.5,  heart: -0.25, order: 1,      role: 0.75  } },
+    { id: 'M08', slug: 'field-fixer',     coord: { drive: -1,    heart: -0.75, order: -0.5,   role: -0.25 } }
+  ];
+
+  var OPPOSITE = {
+    M01: 'M08', M08: 'M01',
+    M02: 'M07', M07: 'M02',
+    M03: 'M06', M06: 'M03',
+    M04: 'M05', M05: 'M04'
+  };
+
+  /* ------------------------------ 八种机体的文案 ------------------------------ */
+  var CONTENT = {
+    M01: {
+      name: '机魂总调度',
+      tagline: '脑洞已经接入，先把大家的频道对齐。',
+      desc: '你的脑洞不满足于独自闪烁，更想把人和 AI 接成一张任务网。你习惯先问清大家要什么，再把新想法拆成能推进的线路；如果讨论开始四处冒火花，你会想给它们找个总开关。',
+      strengths: [
+        '愿意为新点子留出试运行的入口',
+        '在分派任务前关注沟通是否对齐',
+        '倾向把讨论逐步接到可推进的步骤上'
+      ],
+      watch: [
+        '线路接得太多时，可能迟迟没有关闭多余任务',
+        '为了让各方都跟上，可能反复调整已经够用的安排'
+      ],
+      tips: [
+        '每轮只保留一个正在验证的新方向',
+        '把交给 AI 的任务写成一句明确要求',
+        '收尾时说明哪些结果需要自己再核对'
+      ],
+      oppositeNote: '一个把全局接成任务网，一个先把眼前修好；凑在一起，刚好一个铺线、一个落地。'
     },
-    EWSC: {
-      name: '灵感整理师', emoji: '📮',
-      tagline: '温柔地和 AI 一起乱想，再把想法整理成册',
-      desc: '你喜欢和 AI 来回聊，从对话里挖出好东西，然后一点点把它整理清楚。你不急着当主角，更享受「我们一起想出来了」的那种默契。',
-      strengths: ['善于用追问把 AI 的潜力逼出来', '能把散乱的对话变成结构清晰的笔记', '是团队里的润滑剂，让人愿意开口'],
-      watch: ['容易聊得很嗨，但迟迟不落地', '不太抢方向盘，好想法可能被别人拿走'],
-      tips: ['每次聊完固定写三行「下一步做什么」', '主动把整理结果发出去，让贡献被看见', '把「最后帮我收口」这类任务交给 AI']
+    M02: {
+      name: '霓虹树洞',
+      tagline: '先接住这句话，下一步边聊边长出来。',
+      desc: '一句没说清的想法，也能成为你和 AI 聊下去的入口。你愿意顺着有感觉的线索走，边接话边发现方向；比起立刻套进固定步骤，你更喜欢给对话留一点自由生长的空间。',
+      strengths: [
+        '愿意让尚未成形的想法先进入对话',
+        '接受 AI 提案后再一起修改的协作方式',
+        '不急着让每次交流都套进同一份模板'
+      ],
+      watch: [
+        '来回接话可能延长讨论，下一步却仍未落定',
+        '对话顺畅时，可能晚一点才检查信息是否可靠'
+      ],
+      tips: [
+        '聊完补一句现在准备做什么',
+        '把情绪支持与事实查证分成两个问题',
+        '为开放讨论留一个可以停下来的时间点'
+      ],
+      oppositeNote: '一个让对话自由生长，一个把经验铸成流程；你们合在一起，灵感和章法都不会缺席。'
     },
-    EWIP: {
-      name: '脑洞共创官', emoji: '🎠',
-      tagline: '脑洞开到最大，快乐地和 AI 一起造东西',
-      desc: '你的关键词是「好玩」。你不太在意规矩，想到就拉着 AI 一起试，经常在玩的过程里撞出别人想不到的创意。',
-      strengths: ['创意密度高，能把不相干的东西连起来', '对 AI 的反馈天然敏感，配合默契', '启动速度快，从想法到原型只要半天'],
-      watch: ['热情来得快去得也快，容易半途换方向', '流程和文档对你来说太枯燥，交付质量不稳定'],
-      tips: ['找一个「收尾搭子」帮你把成品打磨完', '把大创意切成三个小实验，逐个验证', '给每次发散设一个明确的停手信号']
+    M03: {
+      name: '数据潜航员',
+      tagline: '让 AI 先下潜，沿着证据链慢慢打捞。',
+      desc: '你愿意让 AI 先带出一条线索，再沿着依据、步骤和记录继续下潜。新发现可以很诱人，但你总想知道它从哪里来、哪些部分值得相信。上浮时，最好能带回一盒整理好的证据。',
+      strengths: [
+        '倾向在接纳建议时继续追问依据',
+        '愿意借助步骤和记录整理复杂信息',
+        '接受从 AI 的初稿或提案开始协作'
+      ],
+      watch: [
+        '核对路线不断加深时，可能忘记原本只想回答的小问题',
+        'AI 给出的结构很完整时，可能较晚才重新审视前提'
+      ],
+      tips: [
+        '下潜前写清这次只需要确认的问题',
+        '让 AI 区分已知事实与推测',
+        '找一条独立来源核对最关键的结论'
+      ],
+      oppositeNote: '一个沿着证据慢慢下潜，一个盯着终点随时改线；一个求稳，一个求进，刚好互相校准。'
     },
-    EWIC: {
-      name: '灵感缪斯', emoji: '🌙',
-      tagline: '把 AI 当成树洞和镜子，在对话里认识自己',
-      desc: '你和 AI 的关系更像朋友。你用它梳理情绪、整理思绪，很少把它当工具使唤。你的深度对话能力，常常能挖出别人挖不到的东西。',
-      strengths: ['能问出别人问不出的好问题', '对语言和情绪的分寸感很强', '持续记录与反思，积累深厚'],
-      watch: ['容易陷在「聊得很爽」里，实际产出偏少', '较少把 AI 用在高强度交付场景'],
-      tips: ['给每次深度对话留一个产出物（一段文字或一个决定）', '试试用 AI 直接推进一件卡了很久的实事', '把对话笔记定期整理成可分享的内容']
+    M04: {
+      name: '义体拆解客',
+      tagline: '先拆开看看，再决定这块模块怎么接。',
+      desc: '新工具到手，你的好奇心已经开始找螺丝刀。你喜欢自己设一个小问题，换几种接法，看反馈到底怎么变；说明书可以参考，下一步实验通常由你来定。',
+      strengths: [
+        '愿意通过小尝试了解工具的边界',
+        '倾向要求能够解释或核对的反馈',
+        '在探索中保留自己安排下一步的空间'
+      ],
+      watch: [
+        '新接口很有意思时，可能把原任务暂时拆散',
+        '只顾眼前实验，可能没有留下足够的复用说明'
+      ],
+      tips: [
+        '动手前只选一个想验证的假设',
+        '记录一次成功输入和一次失败输入',
+        '试完用三句话说明发现与适用范围'
+      ],
+      oppositeNote: '一个先拆开、亲手验证，一个先听清、把声道调顺；一个开路，一个收束，配合起来更完整。'
     },
-    ELSP: {
-      name: '探索型架构师', emoji: '🏗️',
-      tagline: '先摸清 AI 的边界，再给它设计一套跑得通的系统',
-      desc: '你好奇，但更讲逻辑。你喜欢把新工具的边界摸透，然后设计出一套别人也能照着跑的方法。你是那种「先把地图画出来」的探索者。',
-      strengths: ['系统化能力强，能把探索成果变成方法', '对模型能力边界判断准确', '抽象与结构化表达出色'],
-      watch: ['容易在「设计完美流程」上花太久', '对人的情绪信号不够敏感'],
-      tips: ['先跑通最小闭环，再谈架构', '文档里多写「为什么这样做」，帮别人少踩坑', '把方法讲给非技术同事听，检验可用性']
+    M05: {
+      name: '人机调音师',
+      tagline: '先听清这次要什么，再把人机声道调顺。',
+      desc: '你希望事情有个着落，也希望沟通能落在合适的频道上。AI 可以先交一版，你会按人的感受和实际要求慢慢调；内容、语气与需求终于对上时，整条声道才算顺了。',
+      strengths: [
+        '愿意把当前需要和交流感受一起说出来',
+        '接受先有草稿再逐步调节的过程',
+        '倾向把讨论收向这次真正需要的结果'
+      ],
+      watch: [
+        '反复调整语气时，可能压缩了事实核对的时间',
+        '为了让互动顺滑，可能较晚才提出自己不同意的部分'
+      ],
+      tips: [
+        '先列出结果必须满足的两项要求',
+        '分别检查内容是否准确与表达是否合适',
+        '不同意时直接指出需要修改的位置'
+      ],
+      oppositeNote: '一个先听清、慢慢调，一个先拆开、马上试；一个负责顺，一个负责快，互补得正好。'
     },
-    ELSC: {
-      name: '前沿研究员', emoji: '🔬',
-      tagline: '安静地把每个新模型都试一遍，然后告诉你结论',
-      desc: '你更像研究者：不追热闹，但每次评测都有自己的判断。你习惯把问题拆开、验证、记录，再给出严谨的结论。',
-      strengths: ['实验设计严谨，结论可信', '善于对比评测，能给出选型建议', '独立工作能力强，不需要被推动'],
-      watch: ['喜欢研究，但推广和表达偏少', '追求完备，容易错过窗口期'],
-      tips: ['给研究设一个「够用了就发出去」的标准', '用一页纸把结论推给需要的人', '把重复的评测流程自动化']
+    M06: {
+      name: 'DDL领航员',
+      tagline: '终点先标出来，航线允许途中改。',
+      desc: '你喜欢先把终点标出来，再握着方向盘灵活改线。AI 的建议、现场的反馈、人的需要都可以成为新路标；你在意的是这一轮怎样继续推进，而不是每一步都必须照原路线走。',
+      strengths: [
+        '倾向先说明这轮协作准备往哪里走',
+        '愿意在反馈出现后调整具体路径',
+        '在推动任务时给沟通和换挡留出空间'
+      ],
+      watch: [
+        '临时改线较多时，可能需要额外解释当前版本',
+        '想继续推进时，可能没有单独留出最后复核的时间'
+      ],
+      tips: [
+        '先约定一个最小可交付的结果',
+        '每次改方向都补一句现在以什么为准',
+        '结束前留一个固定的人工检查节点'
+      ],
+      oppositeNote: '一个盯终点、随时改线，一个沿证据、慢慢打捞；一个敢冲，一个敢查，能互相兜底。'
     },
-    ELIP: {
-      name: '极客拆解者', emoji: '🔧',
-      tagline: '不信宣传，亲手把模型拆开看看它到底行不行',
-      desc: '你对 AI 的态度是「先试试再说」。你爱走非主流路径，用奇怪的方式试出边界，对原理的兴趣远大于官方说明。',
-      strengths: ['动手能力强，能快速验证真伪', '善于发现工具的非典型用法', '不怕失败，试错成本控制得好'],
-      watch: ['容易一头钻进技术细节，忽略真实需求', '对规范和协作流程耐心不足'],
-      tips: ['每次拆解前先写下「要回答什么问题」', '把发现整理成团队能用的技巧清单', '提醒自己：能用就行，不必知晓一切']
+    M07: {
+      name: '协议铸造师',
+      tagline: '接口先约好，再让任务一段段接起来。',
+      desc: '你喜欢先约好输入、步骤和验收方式，再让任务一段段接起来。遇到反复出现的工作，你会想把经验铸成模板或流程，让下一轮协作有章可循；必要时，也会为例外留一个手动接口。',
+      strengths: [
+        '愿意明确任务的输入与输出要求',
+        '倾向为常见协作保留可复用的步骤',
+        '在使用 AI 时保留安排顺序与检查节点的空间'
+      ],
+      watch: [
+        '模板越来越完整时，可能不太愿意临时换一种做法',
+        '小任务也采用完整流程时，可能增加不必要的步骤'
+      ],
+      tips: [
+        '按任务大小决定需要几步流程',
+        '给模板留一处可以偏离常规的出口',
+        '定期删去没有实际作用的检查项'
+      ],
+      oppositeNote: '一个把经验铸成流程，一个让对话自由生长；一个给骨架，一个给血肉，凑在一起刚刚好。'
     },
-    ELIC: {
-      name: '实验室游侠', emoji: '🧪',
-      tagline: '一个人、一台电脑，把 AI 的每个角落都试过一遍',
-      desc: '你独立、理性、爱较真。你不太需要别人配合，自己就能搭起一套实验，慢慢把问题搞清楚。你是那种「数据不撒谎」的人。',
-      strengths: ['独立探索的续航力强', '对细节和异常敏感', '结论经得起复现'],
-      watch: ['容易低估沟通成本，成果传播有限', '较少主动争取资源和关注'],
-      tips: ['把过程记录成可复现的清单，方便交接', '主动找一个人对齐方向，避免白做', '定期把成果换成看得见的产出']
-    },
-    DWSP: {
-      name: 'AI 工作流总监', emoji: '📊',
-      tagline: '目标清晰、共情到位，把 AI 编进团队的生产线',
-      desc: '你知道要什么，也懂人。你会先跟人对齐，再设计一套人机配合的流程，让整件事又快又稳地交付出来。',
-      strengths: ['能把 AI 落地成可复制的团队流程', '沟通与推进力强，跨部门也推得动', '对交付质量和节奏敏感'],
-      watch: ['流程依赖度高，遇到例外情况会不顺', '容易把自己变成瓶颈'],
-      tips: ['给流程留一个「手动兜底」的出口', '培养第二个人接手你的流程', '定期砍掉不再增值的环节']
-    },
-    DWSC: {
-      name: '团队 AI 赋能师', emoji: '🤝',
-      tagline: '把好用的 AI 方法，手把手教给身边每个人',
-      desc: '你的成就感来自「大家一起变强」。你会主动整理、分享、答疑，把 AI 从一个工具变成一个团队习惯。',
-      strengths: ['同理心强，能照顾不同水平的同事', '擅长把复杂方法讲简单', '自发建设团队氛围'],
-      watch: ['揽下太多答疑，自己的深度工作被切碎', '不好意思拒绝别人的求助'],
-      tips: ['把常见问题做成可自助查阅的文档', '设定固定答疑时间，其他时间保持专注', '给自己留一个「只属于我」的进阶项目']
-    },
-    DWIP: {
-      name: '增长操盘手', emoji: '🚀',
-      tagline: '要结果、要速度，也要人愿意跟着你跑',
-      desc: '你擅长在不确定里快速出手：先用 AI 做出粗胚，再用直觉判断往哪推，边跑边调。你最怕的不是犯错，而是慢。',
-      strengths: ['决策快，能在模糊中推进', '对结果负责，交付意识强', '善于带动氛围，让人愿意跟上'],
-      watch: ['追求速度时容易忽略细节和风险', '对慢节奏的同事缺少耐心'],
-      tips: ['关键决策前强制做一次「最坏情况」检查', '给细节型同事留出校验时间', '把「试过但废掉」的方案也记录下来']
-    },
-    DWIC: {
-      name: '敏捷交付者', emoji: '🎯',
-      tagline: '靠 AI 一个人干完一支队伍的活，稳稳交付',
-      desc: '你务实、灵活、配合度高。给你一个目标，你能自己拆、自己试、自己交付，中间不太需要人盯着。',
-      strengths: ['独立交付能力强，靠谱', '学习和调整速度快', '对人和流程都不挑，适应性强'],
-      watch: ['默默扛下太多，容易被当成理所当然', '较少主动提出更大的目标'],
-      tips: ['定期主动同步进度，让价值被看见', '接活前先确认优先级，而不是全接', '给自己的工作设一个升级方向']
-    },
-    DLSP: {
-      name: 'AI 系统工程师', emoji: '⚙️',
-      tagline: '把 AI 变成一条稳定、可复用、能追溯的流水线',
-      desc: '你要结果，也要秩序。你会把 AI 严格约束在流程里：输入规范、输出可控、失败可回溯。你是团队里「这事交给他就放心」的角色。',
-      strengths: ['工程化能力强，方案稳定可维护', '质量控制严格，交付可信', '擅长把一次性成果变成资产'],
-      watch: ['对探索性、没有标准答案的任务不够耐心', '流程偏重，小任务上显得过度设计'],
-      tips: ['按任务规模选择「重流程」还是「轻流程」', '定期花时间试新工具，防止方案老化', '把规范写成模板，减少沟通成本']
-    },
-    DLSC: {
-      name: '质量守门人', emoji: '🛡️',
-      tagline: '每一个 AI 输出，都要先过你这道审校关',
-      desc: '你谨慎、严谨、责任感强。你会核对事实、检查逻辑、补齐边界条件，别人敢直接使用你过手的稿子。',
-      strengths: ['查错能力强，能发现别人忽略的问题', '标准清晰，判断一致', '责任感强，交付质量有保证'],
-      watch: ['审校耗时长，容易成为流程瓶颈', '对「差不多就行」的场景过于较真'],
-      tips: ['按重要度分档，不同档位用不同审校强度', '把常犯错误做成清单，加速核对', '提醒自己：及时交付也是一种质量']
-    },
-    DLIP: {
-      name: '自动化猎人', emoji: '🕹️',
-      tagline: '找到重复劳动，用 AI 一枪打掉它',
-      desc: '你对「浪费时间的重复」极其敏感，总在琢磨怎么让 AI 少让人动手。你喜欢动手做小工具，做完立刻见效。',
-      strengths: ['自动化嗅觉敏锐，投入产出意识强', '动手快，能立刻做出可用的小工具', '善于把逻辑判断变成规则'],
-      watch: ['过度自动化，维护成本反而变高', '没耐心做文档和交接'],
-      tips: ['先算「维护成本 vs 节省时间」再动手', '给脚本写三行使用说明', '把自动化成果登记成清单，别重复造轮子']
-    },
-    DLIC: {
-      name: '精准执行者', emoji: '🎖️',
-      tagline: '指令清楚、结果干净，你是 AI 最喜欢的那种人',
-      desc: '你务实、直接、配合度高。你清楚要什么，表达简洁，AI 给你的结果往往直接能用。你不追求花哨，只追求这件事被干净完成。',
-      strengths: ['需求表达准确，返工率低', '执行稳定，质量一致', '不计较形式，聚焦结果'],
-      watch: ['较少主动探索新玩法，容易停在熟练区', '不太主动表达自己的贡献'],
-      tips: ['每月留一点时间试一个新工具', '把你的提问方式记成模板分享出去', '主动争取更有挑战性的任务']
+    M08: {
+      name: '外脑快修侠',
+      tagline: '先处理眼前这件事，方法够用就上手。',
+      desc: '眼前有件事卡住了，你会先让 AI 拿出几种可用方案，挑一版试起来，再按现场情况补一块、换一块。工具合用就上手，方法不必拘泥；收工前，把真正需要自己接管的部分留在视线里。',
+      strengths: [
+        '倾向围绕当前需要提出具体问题',
+        '愿意先拿一版方案进行实际修改',
+        '接受按任务变化调整做法而非固定走同一路线'
+      ],
+      watch: [
+        '眼前方案已经可用时，可能没有记录它依赖的条件',
+        '连续解决小问题时，可能较晚才回看整体是否一致'
+      ],
+      tips: [
+        '使用建议前确认最重要的一个前提',
+        '把需要反复操作的部分记成简短清单',
+        '任务结束后检查哪些地方仍要自己接手'
+      ],
+      oppositeNote: '一个先解决眼前，一个先接住全局；一个现场动手，一个统筹线路，搭在一起很顺。'
     }
   };
 
+  /* ------------------------------ 组装类型表 ------------------------------ */
+
+  var TYPES = PROTOTYPES.map(function (p) {
+    var c = CONTENT[p.id];
+    return {
+      id: p.id,
+      slug: p.slug,
+      name: c.name,
+      tagline: c.tagline,
+      desc: c.desc,
+      strengths: c.strengths.slice(),
+      watch: c.watch.slice(),
+      tips: c.tips.slice(),
+      image: 'assets/img/' + p.id.toLowerCase() + '.webp',
+      thumb: 'assets/img/thumbs/' + p.id.toLowerCase() + '.webp',
+      oppositeId: OPPOSITE[p.id],
+      oppositeNote: c.oppositeNote,
+      coord: {
+        drive: p.coord.drive,
+        heart: p.coord.heart,
+        order: p.coord.order,
+        role: p.coord.role
+      }
+    };
+  });
+
+  var TYPE_BY_ID = {};
+  var TYPE_BY_SLUG = {};
+  TYPES.forEach(function (t, i) {
+    t.index = i;
+    TYPE_BY_ID[t.id] = t;
+    TYPE_BY_SLUG[t.slug] = t;
+  });
+
   /* ------------------------------ 工具函数 ------------------------------ */
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
   function dimKeys(survey) {
     var keys = Object.keys((survey && survey.dimensions) || {});
-    // 保持固定顺序，保证四字代码稳定
     var ordered = DIM_ORDER.filter(function (k) { return keys.indexOf(k) >= 0; });
     keys.forEach(function (k) { if (ordered.indexOf(k) < 0) ordered.push(k); });
     return ordered;
   }
 
-  /** 计算每个维度的理论最低分/最高分（问卷改动后自动适配） */
+  /** 每个维度的理论最低/最高分（题目改动后自动适配） */
   function theoreticalRange(survey) {
     var keys = dimKeys(survey);
     var range = {};
@@ -170,14 +270,79 @@
     return range;
   }
 
+  /** 原始分 → 归一化坐标（每一维除以该维理论极值的绝对值；对称时即 s/8） */
+  function normalize(raw, survey) {
+    var keys = dimKeys(survey);
+    var range = theoreticalRange(survey);
+    var out = {};
+    keys.forEach(function (k) {
+      var maxAbs = Math.max(range[k].max, -range[k].min);
+      out[k] = maxAbs > 0 ? clamp(Number(raw[k] || 0) / maxAbs, -1, 1) : 0;
+    });
+    return out;
+  }
+
+  function distanceTo(type, x) {
+    var sum = 0;
+    for (var i = 0; i < DIM_ORDER.length; i++) {
+      var k = DIM_ORDER[i];
+      var d = Number(x[k] || 0) - type.coord[k];
+      sum += d * d;
+    }
+    return sum / DIM_ORDER.length;
+  }
+
+  /** 归一化坐标 → 最近机体、并列候选、次佳差距 */
+  function matchNormalized(x) {
+    var distances = {};
+    var best = Infinity;
+    TYPES.forEach(function (t) {
+      var d = distanceTo(t, x);
+      distances[t.id] = d;
+      if (d < best) best = d;
+    });
+
+    var candidates = TYPES.filter(function (t) {
+      return Math.abs(distances[t.id] - best) < 1e-9;
+    });
+    var rest = TYPES.filter(function (t) { return candidates.indexOf(t) < 0; })
+      .sort(function (a, b) { return distances[a.id] - distances[b.id]; });
+    var second = rest.length ? distances[rest[0].id] : null;
+
+    var near = [];
+    if (candidates.length === 1 && second !== null && (second - best) <= NEAR_THRESHOLD + 1e-12) {
+      near = rest.filter(function (t) {
+        return (distances[t.id] - best) <= NEAR_THRESHOLD + 1e-12;
+      });
+    }
+
+    var allNeutral = DIM_ORDER.every(function (k) { return Math.abs(Number(x[k] || 0)) < 1e-12; });
+
+    return {
+      candidates: candidates,
+      display: candidates[0],
+      distances: distances,
+      bestDistance: best,
+      secondDistance: second,
+      tie: candidates.length > 1,
+      allNeutral: allNeutral && candidates.length === TYPE_COUNT,
+      near: near
+    };
+  }
+
+  /** 原始分直接匹配（测试/后台排查用，正式流程请用 score） */
+  function matchRaw(raw, survey) {
+    return matchNormalized(normalize(raw || {}, survey));
+  }
+
   /**
-   * 计分
+   * 计分主函数
    * @param {Object} survey  window.SURVEY
-   * @param {Object} answers { q01: 0, q02: 2, ... } 选项下标
-   * @returns {Object} 结果对象（可直接存库）
+   * @param {Object} answers { q01: 0, q02: 2, ... }（选项下标）
    */
   function score(survey, answers) {
     var keys = dimKeys(survey);
+    var questions = (survey && survey.questions) || [];
     var range = theoreticalRange(survey);
     var raw = {};
     keys.forEach(function (k) { raw[k] = 0; });
@@ -185,92 +350,120 @@
     var answered = 0;
     var detail = [];
 
-    (survey.questions || []).forEach(function (q) {
+    questions.forEach(function (q) {
       var idx = answers ? answers[q.id] : undefined;
       if (idx === undefined || idx === null || idx === '') return;
-      var opt = (q.options || [])[idx];
+      idx = Number(idx);
+      if (!isFinite(idx) || Math.floor(idx) !== idx || idx < 0 || idx >= (q.options || []).length) return;
+      var opt = q.options[idx];
       if (!opt) return;
       answered++;
       var picked = {};
       keys.forEach(function (k) {
         var v = Number((opt.scores && opt.scores[k]) || 0);
-        raw[k] += v;
-        if (v) picked[k] = v;
+        if (v) { raw[k] += v; picked[k] = v; }
       });
-      detail.push({ id: q.id, index: Number(idx), text: opt.text, scores: picked });
+      detail.push({ id: q.id, index: idx, text: opt.text, score: picked });
     });
 
-    var codes = [];
-    var percents = {};
-    var poles = {};
+    var total = questions.length;
+    var complete = total > 0 && answered === total;
+
+    var x = {};
     keys.forEach(function (k) {
-      var r = range[k];
-      var span = r.max - r.min;
-      var pct = span > 0 ? ((raw[k] - r.min) / span) * 100 : 50;
-      pct = Math.max(0, Math.min(100, pct));
-      var left = survey.dimensions[k].left;
-      var right = survey.dimensions[k].right;
-      var isLeft = raw[k] > 0 || (raw[k] === 0 && pct >= 50);
-      poles[k] = isLeft ? left.code : right.code;
-      codes.push(poles[k]);
+      var maxAbs = Math.max(range[k].max, -range[k].min);
+      x[k] = maxAbs > 0 ? raw[k] / maxAbs : 0;
+    });
+
+    var match = matchNormalized(x);
+
+    var percents = {};
+    keys.forEach(function (k) {
+      var dim = (survey.dimensions && survey.dimensions[k]) || {};
+      var left = dim.left || {};
+      var right = dim.right || {};
+      var leftPct = clamp(Math.round(50 + 50 * x[k]), 0, 100);
       percents[k] = {
-        left: Math.round(pct),
-        right: 100 - Math.round(pct),
-        leftCode: left.code, rightCode: right.code,
-        leftName: left.name, rightName: right.name,
-        pole: isLeft ? 'left' : 'right'
+        left: leftPct,
+        right: 100 - leftPct,
+        leftName: left.name || '',
+        rightName: right.name || '',
+        leftCode: left.code || '',
+        rightCode: right.code || '',
+        pole: raw[k] > 0 ? 'left' : (raw[k] < 0 ? 'right' : 'neutral'),
+        raw: raw[k],
+        normalized: x[k]
       };
     });
 
-    var code = codes.join('');
-    var type = TYPES[code] || null;
+    var profileCode = keys.map(function (k) {
+      var dim = (survey.dimensions && survey.dimensions[k]) || {};
+      if (raw[k] > 0) return (dim.left && dim.left.code) || 'X';
+      if (raw[k] < 0) return (dim.right && dim.right.code) || 'X';
+      return 'X';
+    }).join('');
 
     return {
-      code: code,
-      name: type ? type.name : '未知类型',
-      emoji: type ? type.emoji : '❓',
-      tagline: type ? type.tagline : '',
+      complete: complete,
       answered: answered,
-      total: (survey.questions || []).length,
-      scores: raw,
+      total: total,
+      raw: raw,
+      normalized: x,
       percents: percents,
-      poles: poles,
+      profileCode: profileCode,
+      candidates: match.candidates,
+      display: match.display,
+      distances: match.distances,
+      bestDistance: match.bestDistance,
+      secondDistance: match.secondDistance,
+      tie: match.tie,
+      allNeutral: match.allNeutral,
+      near: match.near,
       detail: detail
     };
   }
 
-  /** 取互补类型代码（每个维度取反） */
-  function flipCode(code) {
-    var map = { E: 'D', D: 'E', W: 'L', L: 'W', S: 'I', I: 'S', P: 'C', C: 'P' };
-    return String(code || '').split('').map(function (c) { return map[c] || c; }).join('');
-  }
+  function typeById(id) { return TYPE_BY_ID[id] || null; }
+  function typeBySlug(slug) { return TYPE_BY_SLUG[String(slug || '')] || null; }
 
-  function typeOf(code) { return TYPES[code] || null; }
-
-  /** 生成分享用的纯文本结果 */
+  /** 分享文案：只有机体名，不带任何字母代号 */
   function shareText(result, survey) {
+    if (!result || !result.display) return '';
     var lines = [];
-    lines.push('我的 AI 人格是「' + result.name + '」' + result.emoji + '（' + result.code + '）');
-    lines.push(result.tagline || '');
-    if (survey && survey.dimensions) {
-      Object.keys(survey.dimensions).forEach(function (k) {
-        var p = result.percents[k];
-        if (!p) return;
-        lines.push('· ' + survey.dimensions[k].label + '：' + p.leftName + ' ' + p.left + '% / ' + p.rightName + ' ' + p.right + '%');
-      });
+    lines.push('我的 AI 协作机体是「' + result.display.name + '」');
+    lines.push(result.display.tagline);
+    var keys = Object.keys((survey && survey.dimensions) || {});
+    keys.forEach(function (k) {
+      var dim = survey.dimensions[k];
+      var p = result.percents && result.percents[k];
+      if (!p) return;
+      if (p.pole === 'neutral') {
+        lines.push('· ' + dim.label + '：均衡 50:50');
+      } else {
+        lines.push('· ' + dim.label + '：' + p.leftName + ' ' + p.left + '% / ' + p.rightName + ' ' + p.right + '%');
+      }
+    });
+    if (result.tie && result.candidates.length > 1) {
+      lines.push('（同时贴近：' + result.candidates.map(function (t) { return t.name; }).join('、') + '；并列，展示顺序不代表更准确）');
+    } else if (result.near && result.near.length) {
+      lines.push('（同时接近「' + result.near[0].name + '」，这只是展示提示）');
     }
-    lines.push('你也来测测自己的 AI 人格 →');
+    lines.push('你也来测测自己的协作机体 →');
     return lines.join('\n');
   }
 
   var Engine = {
     DIM_ORDER: DIM_ORDER,
-    TYPES: TYPES,
+    NEAR_THRESHOLD: NEAR_THRESHOLD,
+    types: TYPES,
+    prototypes: PROTOTYPES,
     dimKeys: dimKeys,
     theoreticalRange: theoreticalRange,
+    normalize: normalize,
+    matchRaw: matchRaw,
     score: score,
-    flipCode: flipCode,
-    typeOf: typeOf,
+    typeById: typeById,
+    typeBySlug: typeBySlug,
     shareText: shareText
   };
 

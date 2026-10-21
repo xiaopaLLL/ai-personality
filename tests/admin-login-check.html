@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>E2E · 数据后台登录页（Supabase 模式）</title>
+<style>
+  body { background:#07100b; color:#e9eedf; font-family: Consolas, monospace; margin:0; padding:12px; }
+  #log { white-space: pre-wrap; font-size: 13px; line-height: 1.55; margin: 0 0 14px; }
+  iframe { width: 1200px; height: 900px; border: 1px solid #24331f; }
+  .bad { color:#fb7185 }
+</style>
+</head>
+<body>
+<pre id="log">running…</pre>
+<script>
+var lines = [];
+function log(s) {
+  lines.push(s);
+  var el = document.getElementById('log');
+  el.textContent = lines.join('\n');
+  if (s.indexOf('FAIL') >= 0) el.className = 'bad';
+}
+function check(name, cond, extra) {
+  log((cond ? 'RESULT PASS ' : 'RESULT FAIL ') + name + (cond ? '' : '  ← ' + (extra === undefined ? 'false' : extra)));
+}
+function waitFor(fn, timeout, interval) {
+  timeout = timeout || 12000; interval = interval || 60;
+  var t0 = Date.now();
+  return new Promise(function (resolve, reject) {
+    (function tick() {
+      var v;
+      try { v = fn(); } catch (e) { v = null; }
+      if (v) return resolve(v);
+      if (Date.now() - t0 > timeout) return reject(new Error('等待超时'));
+      setTimeout(tick, interval);
+    })();
+  });
+}
+
+localStorage.removeItem('aipt:session:v2');
+var f = document.createElement('iframe');
+f.id = 'adminFrame';
+f.src = '../admin.html';
+document.body.appendChild(f);
+
+f.addEventListener('load', function () { run(); });
+
+async function run() {
+  try {
+    var d = f.contentDocument;
+    await waitFor(function () {
+      return d.getElementById('viewLogin') && d.getElementById('viewLogin').hidden === false;
+    });
+    check('未登录且配置完整时显示登录页', d.getElementById('viewLogin').hidden === false);
+    check('看板隐藏', d.getElementById('viewDash').hidden === true);
+    check('登录表单可见', d.getElementById('loginForm').hidden === false);
+    check('有邮箱 / 密码 / 登录按钮',
+      !!d.getElementById('loginEmail') && !!d.getElementById('loginPwd') && !!d.getElementById('loginBtn'));
+    check('登录说明提到 Supabase', /Supabase/.test(d.getElementById('loginLead').textContent),
+      d.getElementById('loginLead').textContent);
+    check('登录页有 noindex 元信息', /noindex/.test(String(d.querySelector('meta[name="robots"]') && d.querySelector('meta[name="robots"]').getAttribute('content'))));
+    check('页面没有任何 admin 入口链接指向别处', d.querySelectorAll('a[href*="admin"]').length === 0);
+    check('页脚说明只能地址栏访问', /地址栏访问 \/admin\.html/.test(d.body.textContent));
+    var passed = lines.filter(function (s) { return s.indexOf('RESULT PASS') === 0; }).length;
+    var failed = lines.filter(function (s) { return s.indexOf('RESULT FAIL') === 0; }).length;
+    log('SUMMARY passed=' + passed + ' failed=' + failed);
+  } catch (e) {
+    check('登录页 E2E 总流程', false, e && e.message);
+    log('SUMMARY passed=0 failed=1');
+  }
+}
+</script>
+</body>
+</html>

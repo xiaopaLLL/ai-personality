@@ -2,26 +2,27 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>预览：用于截图检查</title>
+<title>预览：新版页面截图用</title>
 <style>
-  html, body { margin: 0; background: #070716; }
-  iframe { display: block; width: 100%; border: 0; }
-  #quiz { height: 1700px; }
-  #admin { height: 1900px; }
-  body[data-stage="quiz"] #quiz { height: 1150px; }
-  body[data-stage="quiz"] #admin, body[data-stage="result"] #admin { display: none; }
-  body[data-stage="admin"] #quiz { height: 1px; }
+  html, body { margin: 0; background: #050b07; }
+  body { display: flex; justify-content: center; }
+  iframe { display: block; border: 0; background: #07100b; }
+  body[data-width="mobile"] iframe { width: 390px; }
+  body[data-width="desktop"] iframe { width: 100%; }
 </style>
 </head>
 <body>
-<iframe id="quiz" src="../index.html"></iframe>
-<iframe id="admin" src="../admin.html"></iframe>
+<iframe id="app" src="../index.html"></iframe>
 <script>
-var stage = (new URLSearchParams(location.search)).get('stage') || 'result';
+var params = new URLSearchParams(location.search);
+var stage = params.get('stage') || 'intro';
+var width = params.get('w') || 'desktop';
+document.body.setAttribute('data-width', width);
 document.body.setAttribute('data-stage', stage);
+
 var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
 function waitFor(fn, timeout) {
-  var t0 = Date.now(); timeout = timeout || 8000;
+  var t0 = Date.now(); timeout = timeout || 10000;
   return new Promise(function (res, rej) {
     (function tick() {
       var v; try { v = fn(); } catch (e) { v = null; }
@@ -31,30 +32,82 @@ function waitFor(fn, timeout) {
     })();
   });
 }
+
+// 正常结果：原始分 (7,6,3,2) → 唯一命中机魂总调度
+var NORMAL_SEQ = [2, 0, 1, 1, 1, 1, 2, 0, 1, 0, 1, 2, 2, 1, 2, 0];
+// 全中性：并列候选
+var NEUTRAL_SEQ = [1, 2, 0, 2, 1, 2, 0, 1, 1, 2, 0, 0, 0, 2, 1, 0];
+
+var stageHeights = {
+  intro: 1200,
+  quiz: 1020,
+  result: 2240,
+  'result-neutral': 2680,
+  share: 1260
+};
+
+function freezeAnimations(doc) {
+  try {
+    var style = doc.createElement('style');
+    style.textContent = '*,*::before,*::after{animation:none!important;transition:none!important}';
+    (doc.head || doc.documentElement).appendChild(style);
+  } catch (e) { /* ignore */ }
+}
+
 window.addEventListener('load', async function () {
-  var qw = document.getElementById('quiz').contentWindow;
+  var f = document.getElementById('app');
+  if (stage === 'share') {
+    f.style.height = (stageHeights.share) + 'px';
+    f.src = '../index.html?type=neon-hollow';
+    await waitFor(function () { return f.contentDocument && f.contentDocument.querySelector('[data-type-name]'); });
+    await waitFor(function () {
+      var img = f.contentDocument.querySelector('[data-type-image]');
+      return img && img.complete && img.naturalWidth > 0;
+    });
+    freezeAnimations(f.contentDocument);
+    await sleep(600);
+    document.title = 'preview-' + stage + '-' + width + '-ready';
+    return;
+  }
+
+  var qw = f.contentWindow;
   var qd = qw.document;
-  await waitFor(function () { return qd.getElementById('typeGrid').children.length; });
-  qd.getElementById('consent').checked = true;
-  qd.getElementById('nickname').value = '小柯';
-  qd.getElementById('startBtn').click();
-  await waitFor(function () { return !qd.getElementById('screen-quiz').classList.contains('hidden'); });
-  await sleep(200);
-  var stop = stage === 'quiz' ? 5 : 99;
-  var guard = 0;
-  while (guard < stop && guard < 20 && qd.getElementById('screen-result').classList.contains('hidden')) {
-    var btns = qd.querySelectorAll('#options .option');
-    if (!btns.length) break;
-    btns[guard % btns.length].click();
-    guard++;
-    await sleep(300);
+  await waitFor(function () { return qd.getElementById('typeGallery') && qd.getElementById('typeGallery').children.length === 8; });
+
+  // 截图页高度：先按 stage 设置，移动端再放大
+  var h = stageHeights[stage] || 2000;
+  if (width === 'mobile') h = Math.round(h * 1.35);
+  f.style.height = h + 'px';
+
+  var seq = (stage === 'result-neutral') ? NEUTRAL_SEQ : NORMAL_SEQ;
+  var needQuiz = stage === 'quiz' || stage === 'result' || stage === 'result-neutral';
+
+  if (needQuiz) {
+    qd.getElementById('consent').checked = true;
+    qd.getElementById('consent').dispatchEvent(new Event('change'));
+    qd.getElementById('nickname').value = '小柯';
+    qd.getElementById('startBtn').click();
+    await waitFor(function () { return !qd.getElementById('screen-quiz').classList.contains('hidden'); });
+    var stop = stage === 'quiz' ? 5 : 16;
+    for (var i = 0; i < stop; i++) {
+      var btns = qd.querySelectorAll('#options .option');
+      if (!btns.length) break;
+      btns[seq[i]].click();
+      await sleep(320);
+    }
+    if (stage !== 'quiz') {
+      await waitFor(function () { return !qd.getElementById('screen-result').classList.contains('hidden') && qd.querySelector('[data-type-name]'); });
+      await waitFor(function () {
+        var img = qd.querySelector('[data-type-image]');
+        return img && img.complete && img.naturalWidth > 0;
+      });
+      freezeAnimations(qd);
+      await sleep(800);
+    }
   }
-  if (stage === 'admin') {
-    var ad = document.getElementById('admin').contentWindow.document;
-    await sleep(400);
-    ad.getElementById('refreshBtn').click();
-  }
-  document.title = 'preview-' + stage + '-ready';
+
+  await sleep(400);
+  document.title = 'preview-' + stage + '-' + width + '-ready';
 });
 </script>
 </body>
