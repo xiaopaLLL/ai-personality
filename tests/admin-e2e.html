@@ -49,7 +49,7 @@ function newRecord(id, code, name, createdAt, nickname, tie) {
     id: id,
     created_at: createdAt,
     survey_id: 'ai-collab-machine',
-    survey_version: 'v2.0',
+    survey_version: 'v2.1',
     result_code: code,
     result_name: name,
     scores: { drive: 7, heart: 6, order: 3, role: 2 },
@@ -118,13 +118,15 @@ var rec2 = newRecord('rec-2', 'M02', '霓虹树洞', todayAt(0, 20),
 var rec3 = newRecord('rec-3', 'M03', '数据潜航员', new Date(now - 2 * 24 * 3600 * 1000).toISOString(), '<b>坏昵称</b>', false);
 rec3.answered = 15;
 delete rec3.answers.q16;
+var rec4 = newRecord('rec-4', 'M04', '义体拆解客', new Date(now - 1 * 24 * 3600 * 1000).toISOString(), 'v20用户', false);
+rec4.survey_version = 'v2.0';
 var old = oldRecord('rec-old', new Date(now - 3 * 24 * 3600 * 1000).toISOString());
 old.answers = { q01: 2, q05: 0 };
 old.answer_detail = [
   { id: 'q01', index: 2, text: '旧版答案文本 A <img src=x onerror="window.__adminXss=2">', scores: { drive: 2 } },
   { id: 'q05', index: 0, text: '旧版答案文本 B', scores: { heart: 2 } }
 ];
-var seed = [rec1, rec2, rec3, old];
+var seed = [rec1, rec2, rec3, rec4, old];
 localStorage.setItem('aipt:local:v2', JSON.stringify(seed));
 
 var f = document.createElement('iframe');
@@ -132,7 +134,6 @@ f.id = 'adminFrame';
 f.src = '../admin.html';
 document.body.appendChild(f);
 
-var failures = 0;
 f.addEventListener('load', function () { run(); });
 
 async function run() {
@@ -150,10 +151,12 @@ async function run() {
     check('顶部显示本地模式提示', banner && banner.hidden === false && /本地模式/.test(banner.textContent), banner && banner.textContent);
     check('本地模式隐藏退出登录按钮', d.getElementById('logoutBtn').hidden === true);
 
-    /* ---------- 状态条 / KPI ---------- */
-    check('状态条显示问卷版本 v2.0', /v2\.0/.test(d.getElementById('statusVersion').textContent),
+    /* ---------- 状态条 / KPI（默认 V2 全部，含 v2.0 + v2.1） ---------- */
+    check('状态条显示 V2 版本范围', /V2/.test(d.getElementById('statusVersion').textContent) &&
+      /v2\.0/.test(d.getElementById('statusVersion').textContent) &&
+      /v2\.1/.test(d.getElementById('statusVersion').textContent),
       d.getElementById('statusVersion').textContent);
-    check('状态条载入 4 条记录', /4/.test(d.getElementById('statusCount').textContent),
+    check('状态条载入 5 条记录', /5/.test(d.getElementById('statusCount').textContent),
       d.getElementById('statusCount').textContent);
     var cards = d.querySelectorAll('#kpis .adm-kpi');
     check('KPI 共 6 张', cards.length === 6, cards.length);
@@ -167,7 +170,8 @@ async function run() {
       }
       return '';
     }
-    check('总答卷 KPI = 3（默认只看新版）', kpiValue('总答卷') === '3', kpiValue('总答卷'));
+    check('总答卷 KPI = 4（V2 全部）', kpiValue('总答卷') === '4', kpiValue('总答卷'));
+    check('新版答卷 KPI = 4（M01–M08）', kpiValue('新版答卷') === '4', kpiValue('新版答卷'));
     check('今日新增 KPI = 2', kpiValue('今日新增') === '2', kpiValue('今日新增'));
     check('并列答卷数 KPI = 1', kpiValue('并列答卷数') === '1', kpiValue('并列答卷数'));
 
@@ -185,7 +189,7 @@ async function run() {
       d.getElementById('filterType').options.length);
 
     /* ---------- 表格 / 安全 ---------- */
-    check('默认表格显示 3 条新版记录', d.querySelectorAll('#tableBody tr').length === 3,
+    check('默认表格显示 4 条 V2 记录', d.querySelectorAll('#tableBody tr').length === 4,
       d.querySelectorAll('#tableBody tr').length);
     check('表格显示中文机体名', /机魂总调度/.test(d.getElementById('tableBody').textContent));
     check('表格显示并列标记', /并列/.test(d.getElementById('tableBody').textContent));
@@ -193,15 +197,63 @@ async function run() {
       'img=' + d.querySelectorAll('#tableBody img').length + ' xss=' + w.__adminXss);
     check('导出按钮存在', !!d.getElementById('exportCsv') && !!d.getElementById('exportJson'));
 
-    /* ---------- 筛选 ---------- */
+    /* ---------- 版本筛选（V1/V2 分组 + 精确版本） ---------- */
     var vsel = d.getElementById('filterVersion');
+    var versionValues = Array.from(vsel.options).map(function (o) { return o.value; });
+    check('版本下拉包含 全部/V1/v1.0/V2/v2.0/v2.1',
+      ['all', 'v1', 'v1.0', 'v2', 'v2.0', 'v2.1'].every(function (v) { return versionValues.indexOf(v) >= 0; }),
+      versionValues.join(','));
+    check('版本下拉存在 V1 / V2 分组', vsel.querySelectorAll('optgroup').length >= 2,
+      vsel.querySelectorAll('optgroup').length);
+    check('默认选中 V2 全部', vsel.value === 'v2', vsel.value);
+
+    vsel.value = 'v2.1';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 3; });
+    check('切到 v2.1 后显示 3 条', d.querySelectorAll('#tableBody tr').length === 3);
+    check('v2.1 状态条显示 v2.1', /v2\.1/.test(d.getElementById('statusVersion').textContent),
+      d.getElementById('statusVersion').textContent);
+
+    vsel.value = 'v2.0';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 1; });
+    check('切到 v2.0 后只显示 1 条', d.querySelectorAll('#tableBody tr').length === 1);
+    check('v2.0 记录展示正确', /义体拆解客/.test(d.getElementById('tableBody').textContent) &&
+      /v2\.0/.test(d.getElementById('tableBody').textContent), d.getElementById('tableBody').textContent.slice(0, 80));
+
+    vsel.value = 'v1';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 1; });
+    check('V1 全部只显示旧版记录', d.querySelectorAll('#tableBody tr').length === 1 &&
+      /EWSP|提示词总导演/.test(d.getElementById('tableBody').textContent), d.getElementById('tableBody').textContent.slice(0, 80));
+    check('V1 范围下机体筛选禁用', d.getElementById('filterType').disabled === true);
+    check('V1 范围下 8 机体分布为空态', /没有 8 机体数据/.test(d.getElementById('typeChart').textContent),
+      d.getElementById('typeChart').textContent.slice(0, 60));
+    check('V1 范围下旧版类型区可见', d.getElementById('legacyBlock').hidden === false);
+
+    vsel.value = 'v1.0';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 1; });
+    check('切到 v1.0 后只显示 1 条', d.querySelectorAll('#tableBody tr').length === 1);
+
     vsel.value = 'all';
     vsel.dispatchEvent(new Event('change'));
-    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 4; });
-    check('版本筛选切到全部后显示 4 条', d.querySelectorAll('#tableBody tr').length === 4);
-    check('旧版记录以旧类型代码展示', /EWSP|提示词总导演/.test(d.getElementById('tableBody').textContent));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 5; });
+    check('全部版本显示 5 条', d.querySelectorAll('#tableBody tr').length === 5);
+    check('全部版本状态条列出 v1.0 / v2.0 / v2.1',
+      /v1\.0/.test(d.getElementById('statusVersion').textContent) &&
+      /v2\.0/.test(d.getElementById('statusVersion').textContent) &&
+      /v2\.1/.test(d.getElementById('statusVersion').textContent) &&
+      d.getElementById('legacyBlock').hidden === false,
+      d.getElementById('statusVersion').textContent);
 
-    vsel.value = 'new';
+    vsel.value = 'v2';
+    vsel.dispatchEvent(new Event('change'));
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 4; });
+    check('切回 V2 全部显示 4 条', d.querySelectorAll('#tableBody tr').length === 4);
+    check('V2 范围下机体筛选恢复可用', d.getElementById('filterType').disabled === false);
+
+    vsel.value = 'v2.1';
     vsel.dispatchEvent(new Event('change'));
     await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 3; });
 
@@ -233,7 +285,7 @@ async function run() {
       d.getElementById('detailTitle').textContent);
     check('弹层元信息含昵称 / 版本 / 用时',
       /测试甲/.test(d.getElementById('detailMeta').textContent) &&
-      /v2\.0/.test(d.getElementById('detailMeta').textContent) &&
+      /v2\.1/.test(d.getElementById('detailMeta').textContent) &&
       /45/.test(d.getElementById('detailMeta').textContent));
     check('四维详情渲染 4 块', d.querySelectorAll('#detailDims .adm-detail-dim').length === 4,
       d.querySelectorAll('#detailDims .adm-detail-dim').length);
@@ -278,10 +330,10 @@ async function run() {
     await waitFor(function () { return modal().hidden === true; });
     check('ESC 可关闭弹层', modal().hidden === true);
 
-    /* 旧版记录：走 answer_detail 文本 */
-    vsel.value = 'all';
+    /* 旧版记录：走 answer_detail 文本（切到 V1 范围） */
+    vsel.value = 'v1';
     vsel.dispatchEvent(new Event('change'));
-    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 4; });
+    await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 1; });
     viewButton('rec-old').click();
     await waitFor(function () { return modal().hidden === false; });
     check('旧版记录渲染 answer_detail 条目', d.querySelectorAll('#detailAnswers .adm-detail-old-item').length === 2,
@@ -294,7 +346,7 @@ async function run() {
     d.getElementById('detailBackdrop').click();
     await waitFor(function () { return modal().hidden === true; });
     check('点击遮罩可关闭弹层', modal().hidden === true);
-    vsel.value = 'new';
+    vsel.value = 'v2.1';
     vsel.dispatchEvent(new Event('change'));
     await waitFor(function () { return d.querySelectorAll('#tableBody tr').length === 3; });
 

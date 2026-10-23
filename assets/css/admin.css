@@ -1649,3 +1649,41 @@
   .adm-detail-dim { padding: 9px 10px; }
   .adm-detail-q { padding: 9px 10px; }
 }
+
+/* =============================================================================
+ *  版本筛选（V1/V2 系列 + 精确版本）与机体筛选联动
+ * ============================================================================= */
+
+.adm-select optgroup {
+  background: var(--panel);
+  color: var(--faint);
+  font-style: normal;
+  font-size: 11px;
+}
+
+.adm-select:disabled,
+.adm-select[aria-disabled="true"] {
+  opacity: .42;
+  cursor: not-allowed;
+}
+
+.adm-filter-hint {
+  margin: 5px 0 0;
+  color: var(--faint);
+  font-size: 9px;
+  letter-spacing: .04em;
+  line-height: 1.5;
+}
+
+.adm-dist-row:disabled {
+  cursor: default;
+  opacity: .5;
+}
+
+.adm-dist-row:disabled:hover {
+  background: transparent;
+  border-left-color: transparent;
+}
+
+.adm-dist-row:disabled .adm-dist-fill { background: var(--faint); }
+

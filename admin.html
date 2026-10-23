@@ -8,8 +8,8 @@
 <meta name="theme-color" content="#07100b">
 <meta name="color-scheme" content="dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2307100b'/%3E%3Crect x='7.5' y='7.5' width='17' height='17' fill='none' stroke='%23d9f24a' stroke-width='2'/%3E%3Cpath d='M16 3v8M16 21v8M3 16h8M21 16h8' stroke='%23d9f24a' stroke-width='2'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="assets/css/style.css?v=2.2">
-<link rel="stylesheet" href="assets/css/admin.css?v=2.2">
+<link rel="stylesheet" href="assets/css/style.css?v=2.3">
+<link rel="stylesheet" href="assets/css/admin.css?v=2.3">
 </head>
 <body class="adm-body">
 
@@ -119,10 +119,10 @@
       <div class="adm-filters" role="group" aria-label="筛选条件">
         <div class="adm-filter">
           <label class="field-label mono" for="filterVersion">版本</label>
+          <!-- 选项由 admin.js 按「已知版本 + 已载入数据里出现的版本」动态重建；
+               这里的静态项只是首屏占位，JS 启动后会整体替换。 -->
           <select class="input adm-select" id="filterVersion">
-            <option value="new">新版数据</option>
-            <option value="all">全部版本</option>
-            <option value="old">旧版数据</option>
+            <option value="v2">V2 全部（v2.x）</option>
           </select>
         </div>
         <div class="adm-filter">
@@ -137,6 +137,7 @@
         <div class="adm-filter">
           <label class="field-label mono" for="filterType">机体</label>
           <select class="input adm-select" id="filterType"></select>
+          <p class="adm-filter-hint" id="filterTypeHint" hidden>旧版记录没有机体编号</p>
         </div>
       </div>
 
@@ -258,10 +259,10 @@
 </noscript>
 
 <!-- scripts：配置 → 题库 → 引擎 → 数据层 → 后台交互；顺序不可调整 -->
-<script src="config.js?v=2.2"></script>
-<script src="assets/js/questions.js?v=2.2"></script>
-<script src="assets/js/personality.js?v=2.2"></script>
-<script src="assets/js/store.js?v=2.2"></script>
-<script src="assets/js/admin.js?v=2.2"></script>
+<script src="config.js?v=2.3"></script>
+<script src="assets/js/questions.js?v=2.3"></script>
+<script src="assets/js/personality.js?v=2.3"></script>
+<script src="assets/js/store.js?v=2.3"></script>
+<script src="assets/js/admin.js?v=2.3"></script>
 </body>
 </html>

@@ -2,9 +2,10 @@
 
 一个纯静态、零构建的在线问卷网站：访客回答 16 道日常 AI 协作情境题，从 4 个维度得到一个四维倾向，再匹配到 8 种「协作机体」之一，结果页给出人物插画、偏好与边界、可尝试的做法。作答数据静默写入 Supabase；前台页面不提供任何数据后台入口，后台页面保留在 `/admin.html`，只能手动输入地址访问。
 
-新版（v2.0）要点：
+新版（v2.1）要点：
 
 - 16 道题 / 4 个维度 / 8 种协作机体；结果页只显示机体中文名和人物图，**不显示 M01–M08 编号，也不显示四字母代号**。
+- 题库 v2.1：16 道题的题面全部换成本期新版文案，维度归属与计分结构不变；`questions.js` 的 `meta.version` 为 `v2.1`，新答卷的 `survey_version` 记为 `v2.1`。
 - 首页简化：首屏是轻量的**纯文字**机体目录（直接列出 8 种协作机体名称），不加载人物图片；人物插画只出现在结果页大图、并列候选小图、对照机体缩略图和分享落地页。
 - 计分做了增强：每题声明主维度，三个选项在主维度上是一正、一负、一中性（`+2/+1`、`-2/-1`、`0`），部分选项额外带一个语义明确的次要维度 `±1`；配合「补偿下调」，四维原始分范围仍是 −8 ~ +8，归一化与百分比公式不变。
 - 机体编号 M01–M08 只作为数据库内部类别标识（`result_code`）；真实四维方向另存在 `percents.match.profileCode` 里，仅用于数据留存。
@@ -74,7 +75,7 @@ npm.cmd test
 node tests/engine.test.mjs   # 计分引擎与数据层：问卷结构、四维计分、次要分补偿、8 机体匹配、记录字段、后台 API / CSV（26 项）
 node tests/smoke.mjs         # 静态资源与页面约定：前台无后台入口、后台页面资源齐全、无编号泄漏、文档关键词（42 项）
 node tests/e2e.mjs           # 前台 headless Chrome：答题 → 结果 → 分享页 → 旧链接 → 全中性并列（38 项）
-node tests/admin-e2e.mjs     # 后台 headless Chrome：local 模式看板 49 项 + Supabase 登录页 8 项（57 项）
+node tests/admin-e2e.mjs     # 后台 headless Chrome：local 模式看板 64 项 + Supabase 登录页 8 项（72 项）
 node tests/screenshots.mjs   # 可选：生成预览截图到 tests/screenshots/（已 gitignore）
 ```
 
@@ -95,8 +96,8 @@ node tests/screenshots.mjs   # 可选：生成预览截图到 tests/screenshots/
   - 正 / 负 / 中性选项的位置不要按固定顺序排。
 - 维度定义在 `SURVEY.dimensions`，顺序为 `drive / heart / order / role`，对应四维表见[设计说明](docs/问卷设计与结果简介.md)。
 - 首屏标题、副标题、简介、隐私告知、是否必须勾选同意、是否收集昵称等，都在 `SURVEY.meta`。
-- 改完题目后**把 `meta.version` 升一版**（例如 `v2.0` → `v2.1`）：数据库里能区分改版前后的答卷；旧版本的未完成作答进度也会被自动丢弃。
-- 同时把 `index.html`、`admin.html` 里脚本 / 样式引用末尾的 `?v=2.2` 改成新版本号，避免访客浏览器继续用缓存。
+- 改完题目后**把 `meta.version` 升一版**（例如 `v2.1` → `v2.2`）：数据库里能区分改版前后的答卷；旧版本的未完成作答进度也会被自动丢弃。
+- 同时把 `index.html`、`admin.html` 里脚本 / 样式引用末尾的 `?v=2.3` 改成新版本号，避免访客浏览器继续用缓存。
 
 ### 机体文案与原型坐标：`assets/js/personality.js`
 
@@ -142,7 +143,7 @@ node tests/admin-e2e.mjs
 
 | 字段 | 含义 |
 | --- | --- |
-| `survey_version` | 问卷版本（当前 `v2.0`；旧版 16 型记录沿用旧版本号） |
+| `survey_version` | 问卷版本（当前 `v2.1`；旧版 16 型记录沿用旧版本号） |
 | `result_code` / `result_name` | 新版为 `M01`–`M08` / 机体中文名；**仅内部与数据用途** |
 | `scores` | 四维原始分 `{drive, heart, order, role}`，范围 −8 ~ +8 |
 | `percents` | 四维展示百分比（左 / 右 / 中性），新版额外带 `percents.match` |
@@ -164,7 +165,7 @@ node tests/admin-e2e.mjs
 查看数据有两条路径（前台没有任何入口，不要往首页加）：
 
 1. **数据后台页面**：直接在浏览器地址栏打开 `/admin.html`（线上是 `https://xiaopalll.github.io/ai-personality/admin.html`，本地预览是 `http://127.0.0.1:8000/admin.html`）。
-   - `backend: 'supabase'`（当前线上）：用 Supabase → Authentication → Users 里创建的邮箱账号登录。登录后可查看 KPI、8 机体分布（旧的 16 型类型单独一块）、四维平均、16 题选项分布、最近 14 天趋势和答卷记录表；支持版本 / 时间 / 机体筛选、刷新、导出 CSV / JSON、删除单条记录（删除不可恢复）和退出登录。**答卷表格每行可点「查看」（也可点整行）打开单份答卷详情，查看逐题答案、四维百分比与原始分、匹配元数据，并可复制该条 JSON。** 后台默认读取最近 1,000 条，表格最多显示 500 行。
+   - `backend: 'supabase'`（当前线上）：用 Supabase → Authentication → Users 里创建的邮箱账号登录。登录后可查看 KPI、8 机体分布（旧的 16 型类型单独一块）、四维平均、16 题选项分布、最近 14 天趋势和答卷记录表；支持版本 / 时间 / 机体筛选（版本下拉按真实版本切换：全部版本、V1 全部、v1.0、V2 全部、v2.0、v2.1，默认 V2 全部；已知版本与数据中出现的新版本都会自动出现；切到 V1 时旧版类型区显示、机体筛选自动禁用）、刷新、导出 CSV / JSON、删除单条记录（删除不可恢复）和退出登录。**答卷表格每行可点「查看」（也可点整行）打开单份答卷详情，查看逐题答案、四维百分比与原始分、匹配元数据，并可复制该条 JSON。** 后台默认读取最近 1,000 条，表格最多显示 500 行。
    - 登录过期（401）会自动回到登录页，重新登录即可；能登录但看不到数据（403）通常是 Supabase RLS 的 `auth_can_read` 策略缺失，删除失败多为 `auth_can_delete` 缺失，按 `supabase/schema.sql` 检查。
    - `backend: 'local'`：无需登录，直接看当前浏览器 localStorage 里的记录（顶部提示「本地模式」）。
    - `backend: 'custom'`：后台暂不支持，只显示未配置提示。

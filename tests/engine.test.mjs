@@ -1,15 +1,12 @@
 /**
- * 逻辑测试：新版问卷结构 + 四维计分 + 8 机体距离匹配 + 数据层
+ * 逻辑测试：问卷结构 + 四维计分 + 8 机体距离匹配 + 数据层 + 数据后台 API
  * 运行： node tests/engine.test.mjs
  *
- * 新版计分（在 resources/新题目与计分说明.md 基础上做了增强）：
- *  - 16 题、每维 4 题；每题声明一个主维度，三个选项分别是主维度正分 / 负分 / 0 分
- *  - 部分选项带一个「次要维度 ±1」，让相邻倾向也能被看见
- *  - 每加一个次要 +1 就下调该维一个 +2 → +1；每加一个次要 -1 就下调该维一个 -2 → -1
- *    → 四个维度原始分范围仍然都是 -8..8，x=s/8，左侧百分比 = round(50+50x)
- *  - 8 个原型等范数、四对相反画像、唯一自匹配
- *  - 穷举全部可达四维总分，与独立距离计算一致；全中性时 8 个候选并列
- *  - 缺题 / 非法选项不算完成；记录字段不越过 Supabase 已有表结构
+ * 计分规则（v2.1 题库）：
+ *  - 16 题 / 每维 4 题；每题声明主维度，三个选项在主维度上是一正、一负、一中性
+ *  - 部分选项带一个「次要维度 ±1」，通过补偿下调保证每个维度原始分仍为 -8 ~ +8
+ *  - x = s/8，左侧百分比 = round(50+50x)，0 分 50:50
+ *  - 8 个原型等范数、四对相反画像；按四维等权距离匹配，并列保留全部候选
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -35,7 +32,7 @@ function test(name, fn) {
   }
 }
 
-/* --------------------------- 搭一个浏览器沙箱 --------------------------- */
+/* --------------------------- 浏览器沙箱 --------------------------- */
 const mem = new Map();
 const sandbox = {
   console,
@@ -73,7 +70,7 @@ const DIMS = ['drive', 'heart', 'order', 'role'];
 const DIM_INDEX = { drive: 0, heart: 1, order: 2, role: 3 };
 const plain = (v) => JSON.parse(JSON.stringify(v));
 
-/* ------------------------------ 测试工具 ------------------------------ */
+/* ------------------------------ 工具 ------------------------------ */
 
 const questionsOfDim = (k) => SURVEY.questions.filter((q) => q.dim === k);
 
@@ -83,7 +80,6 @@ function answersOf(seq) {
   return answers;
 }
 
-/** 每个维度选最正 / 最负的选项（每题独立取该维最高分） */
 function answersMaximizing(k, sign) {
   const a = {};
   for (const q of SURVEY.questions) {
@@ -108,7 +104,6 @@ const neutralAnswers = () => {
   return a;
 };
 
-/** 独立实现距离计算，避免“用被测代码验证被测代码” */
 function independentDistance(coord, x) {
   let sum = 0;
   for (const k of DIMS) {
@@ -122,11 +117,11 @@ function independentCandidates(x) {
   const dists = Engine.types.map((t) => ({ id: t.id, d: independentDistance(t.coord, x) }));
   const best = Math.min(...dists.map((v) => v.d));
   const candidates = dists.filter((v) => Math.abs(v.d - best) < 1e-9).map((v) => v.id);
-  const second = Math.min(...dists.filter((v) => Math.abs(v.d - best) >= 1e-9).map((v) => v.d));
+  const others = dists.filter((v) => Math.abs(v.d - best) >= 1e-9).map((v) => v.d);
+  const second = others.length ? Math.min(...others) : null;
   return { best, candidates, second };
 }
 
-/** 穷举所有可达四维总分（每题 3 个选项，16 题；用状压 DP 去重） */
 function reachableProfiles() {
   let layer = new Map([['0,0,0,0', [0, 0, 0, 0]]]);
   for (const q of SURVEY.questions) {
@@ -143,7 +138,7 @@ function reachableProfiles() {
   return [...layer.values()].map((s) => ({ drive: s[0], heart: s[1], order: s[2], role: s[3] }));
 }
 
-/** 每个机体一个「完整 16 题作答 → 唯一命中」的见证答案（由穷举后离线挑出） */
+/** 每个机体一份「完整 16 题 → 唯一命中」的见证答案 */
 const WITNESSES = {
   M01: [2, 0, 1, 1, 1, 1, 2, 0, 1, 0, 1, 2, 2, 1, 2, 0],
   M02: [2, 0, 1, 0, 1, 0, 0, 0, 0, 1, 2, 1, 0, 1, 0, 2],
@@ -159,6 +154,7 @@ const WITNESSES = {
 console.log('\n[1] 问卷结构');
 
 await test('共有 16 道题，id 从 q01 到 q16 唯一，每题都声明主维度', () => {
+  assert.equal(SURVEY.meta.version, 'v2.1');
   assert.equal(SURVEY.questions.length, 16);
   const ids = SURVEY.questions.map((q) => q.id);
   assert.deepEqual(plain(ids), Array.from({ length: 16 }, (_, i) => 'q' + String(i + 1).padStart(2, '0')));
@@ -307,7 +303,7 @@ await test('每种机体都有一份唯一命中的完整作答（8 份见证答
 
 await test('全部可达四维总分与独立距离计算一致', () => {
   const profiles = reachableProfiles();
-  assert.ok(profiles.length >= 40000, '可达总分太少，可能题目分值设计有问题: ' + profiles.length);
+  assert.ok(profiles.length >= 40000, '可达总分太少: ' + profiles.length);
   const seenTypes = {};
   let ties = 0;
   let nears = 0;
@@ -386,7 +382,7 @@ await test('buildRecord 只写 schema 已有列，匹配元数据放进 percents
   assert.ok(rec.id && rec.created_at);
   assert.equal(rec.result_code, 'M01');
   assert.equal(rec.result_name, '机魂总调度');
-  assert.equal(rec.survey_version, SURVEY.meta.version);
+  assert.equal(rec.survey_version, 'v2.1');
   assert.equal(rec.nickname, '小明');
   assert.equal(rec.duration_ms, 61234);
   assert.equal(rec.user_agent, 'Mozilla/5.0 (Test)');
@@ -519,7 +515,7 @@ await test('local 模式：后台无需登录，能排序/筛选/删除本地记
   assert.equal(rows.length, 2, '应能读到两条本地记录');
   assert.equal(rows[0].id, late.id, '应按 created_at 倒序');
 
-  const filtered = await Store.admin.fetchRows({ version: 'v2.0', from: '2026-10-20T00:00:00.000Z' });
+  const filtered = await Store.admin.fetchRows({ version: 'v2.1', from: '2026-10-20T00:00:00.000Z' });
   assert.equal(filtered.length, 1);
   assert.equal(filtered[0].id, late.id);
 
@@ -558,7 +554,7 @@ await test('supabase 后台：未登录报 UNAUTH；登录后带用户 token 读
     }
     return Promise.resolve({
       ok: true, status: 200,
-      text: () => Promise.resolve(JSON.stringify([{ id: 'row-1', created_at: '2026-10-20T08:00:00.000Z', survey_version: 'v2.0', result_code: 'M01' }]))
+      text: () => Promise.resolve(JSON.stringify([{ id: 'row-1', created_at: '2026-10-20T08:00:00.000Z', survey_version: 'v2.1', result_code: 'M01' }]))
     });
   };
 
@@ -570,10 +566,10 @@ await test('supabase 后台：未登录报 UNAUTH；登录后带用户 token 读
   assert.equal(s.email, 'admin@example.com');
   assert.equal(Store.admin.session().access_token, 'USER_TOKEN');
 
-  const rows = await Store.admin.fetchRows({ version: 'v2.0', limit: 10 });
+  const rows = await Store.admin.fetchRows({ version: 'v2.1', limit: 10 });
   assert.equal(rows.length, 1);
   const getCall = calls.filter((c) => c.url.indexOf('/rest/v1/') >= 0 && !(c.opt && c.opt.method === 'DELETE')).pop();
-  assert.ok(getCall.url.indexOf('survey_version=eq.v2.0') >= 0, '应带版本筛选');
+  assert.ok(getCall.url.indexOf('survey_version=eq.v2.1') >= 0, '应带版本筛选');
   assert.equal(getCall.opt.headers.Authorization, 'Bearer USER_TOKEN');
 
   await Store.admin.remove('row-1');

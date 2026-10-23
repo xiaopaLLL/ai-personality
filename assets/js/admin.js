@@ -33,12 +33,14 @@
   var FETCH_LIMIT = 1000;  // 后台默认读取最近 1000 条
   var TABLE_LIMIT = 500;   // 表格最多渲染 500 行
   var NOTICE_MS = 4500;
+  var DEFAULT_VERSION_FILTER = 'v2';   // 默认 V2 全部（v2.x）
+  var KNOWN_VERSION_LIST = ['1.0', '2.0']; // 已知版本（normalized，不含前导 v），当前版本运行时再补
 
   var state = {
     source: 'local',
     email: '',
     rows: [],
-    filterVersion: 'new',   // new | all | old
+    filterVersion: DEFAULT_VERSION_FILTER, // 'all' | 'v1' | 'v2' | 'v1.0' | 'v2.0' | 'v2.1' | ...
     filterRange: 'all',     // all | today | 7 | 30
     filterType: '',         // '' 或 M01..M08
     filterLegacy: '',       // 旧版四字母代码（点击旧版分布时设置）
@@ -123,18 +125,211 @@
     return (Math.round(v * 10) / 10).toFixed(1) + '%';
   }
 
-  /* ============================== 记录字段解析 ============================== */
+  /* ============================== 版本号工具 ============================== */
+  /* 记录里的 survey_version 可能是 'v2.1' / '2.1' / 'V2.1' / ''；
+   * 这里统一归一化成不带前导 v 的小写串（'2.1'），展示时再补 'v'。 */
 
-  function isNewVersion(row) {
-    if (!row) return false;
-    if (row.survey_version === CURRENT_VERSION) return true;
-    // 极旧数据可能没有 survey_version，但 result_code 已是 M01-M08
-    var ver = row.survey_version;
-    if ((ver === undefined || ver === null || ver === '') && /^M0[1-8]$/.test(String(row.result_code || ''))) {
-      return true;
-    }
-    return false;
+  function normalizeVersion(value) {
+    var s = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
+    if (!s) return '';
+    if (s.charAt(0) === 'v') s = s.slice(1).trim();
+    return s;
   }
+
+  function displayVersion(normalized) {
+    var n = String(normalized === undefined || normalized === null ? '' : normalized);
+    if (!n) return '';
+    return /^\d/.test(n) ? 'v' + n : n;
+  }
+
+  function versionParts(version) {
+    return String(version || '').split(/[.\-_+]/);
+  }
+
+  function compareVersions(a, b) {
+    var pa = versionParts(a);
+    var pb = versionParts(b);
+    var length = Math.max(pa.length, pb.length);
+    for (var i = 0; i < length; i++) {
+      var xa = pa[i] === undefined ? '' : pa[i];
+      var xb = pb[i] === undefined ? '' : pb[i];
+      if (xa === '' || xb === '') return xa === '' ? -1 : 1;
+      var na = parseInt(xa, 10);
+      var nb = parseInt(xb, 10);
+      if (!isNaN(na) && !isNaN(nb)) {
+        if (na !== nb) return na - nb;
+        continue;
+      }
+      if (xa !== xb) return xa < xb ? -1 : 1;
+    }
+    return 0;
+  }
+
+  function seriesOfVersion(normalized) {
+    var n = String(normalized || '');
+    if (/^1(?:\.|$)/.test(n)) return '1';
+    if (/^2(?:\.|$)/.test(n)) return '2';
+    return '';
+  }
+
+  function isMachineRow(row) {
+    return /^M0[1-8]$/i.test(String(row && row.result_code || ''));
+  }
+
+  function versionOf(row) {
+    return normalizeVersion(row && row.survey_version);
+  }
+
+  function isCurrentVersionRow(row) {
+    return versionOf(row) === normalizeVersion(CURRENT_VERSION);
+  }
+
+  /** 把任意值（含旧的 new/old、无前导 v 的版本）规范成下拉里的 value */
+  function canonicalVersionValue(value) {
+    var raw = String(value === undefined || value === null ? '' : value).trim();
+    if (!raw) return '';
+    var low = raw.toLowerCase();
+    if (low === 'all') return 'all';
+    if (low === 'new') return 'v2';
+    if (low === 'old') return 'v1';
+    var normalized = normalizeVersion(raw);
+    if (!normalized) return '';
+    if (normalized === '1') return 'v1';
+    if (normalized === '2') return 'v2';
+    return /^\d/.test(normalized) ? 'v' + normalized : normalized;
+  }
+
+  function isV1Range() {
+    var canonical = canonicalVersionValue(state.filterVersion);
+    if (canonical === 'v1') return true;
+    return seriesOfVersion(normalizeVersion(canonical)) === '1';
+  }
+
+  /** 已知版本 + 已载入数据里出现过的版本（normalized，去重排序） */
+  function collectVersionList() {
+    var seen = {};
+    var list = [];
+    function add(raw) {
+      var n = normalizeVersion(raw);
+      if (!n || seen[n]) return;
+      seen[n] = true;
+      list.push(n);
+    }
+    KNOWN_VERSION_LIST.forEach(add);
+    add(CURRENT_VERSION);
+    state.rows.forEach(function (row) { add(row && row.survey_version); });
+    list.sort(compareVersions);
+    return list;
+  }
+
+  function rangeLabel() {
+    var selection = state.filterVersion;
+    if (!selection || selection === 'all') {
+      var all = collectVersionList();
+      return all.length
+        ? '全部版本（' + all.map(displayVersion).join(' / ') + '）'
+        : '全部版本';
+    }
+    if (selection === 'v1' || selection === 'v2') {
+      var series = selection.slice(1);
+      var list = collectVersionList().filter(function (version) {
+        return seriesOfVersion(version) === series;
+      });
+      var prefix = selection === 'v1' ? 'V1 全部' : 'V2 全部';
+      return list.length
+        ? prefix + '（' + list.map(displayVersion).join(' / ') + '）'
+        : prefix;
+    }
+    return displayVersion(normalizeVersion(selection)) || selection;
+  }
+
+  function rangeShortLabel() {
+    var selection = state.filterVersion;
+    if (!selection || selection === 'all') return '全部版本';
+    if (selection === 'v1') return 'V1 全部';
+    if (selection === 'v2') return 'V2 全部';
+    return displayVersion(normalizeVersion(selection)) || selection;
+  }
+
+  function createVersionOption(value, label) {
+    var option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    return option;
+  }
+
+  function createVersionGroup(label) {
+    var group = document.createElement('optgroup');
+    group.label = label;
+    return group;
+  }
+
+  /** 把任意版本选择值对齐到 #filterVersion 里实际存在的 option；不存在则回退默认 V2 全部 */
+  function normalizeVersionSelection(value) {
+    var canonical = canonicalVersionValue(value);
+    var select = els.filterVersion;
+    if (select && select.options) {
+      for (var i = 0; i < select.options.length; i++) {
+        if (select.options[i].value === canonical) return canonical;
+      }
+      for (var j = 0; j < select.options.length; j++) {
+        if (select.options[j].value === DEFAULT_VERSION_FILTER) return DEFAULT_VERSION_FILTER;
+      }
+      if (select.options.length) return select.options[0].value;
+    }
+    return canonical || DEFAULT_VERSION_FILTER;
+  }
+
+  /** 按「已知版本 + 数据里出现的版本」重建版本下拉（保留当前选择；失效则回退默认） */
+  function buildVersionFilter() {
+    var select = els.filterVersion;
+    if (!select) return;
+
+    var versions = collectVersionList();
+    var v1 = versions.filter(function (v) { return seriesOfVersion(v) === '1'; });
+    var v2 = versions.filter(function (v) { return seriesOfVersion(v) === '2'; });
+    var others = versions.filter(function (v) { return !seriesOfVersion(v); });
+
+    clear(select);
+    select.appendChild(createVersionOption('all', '全部版本'));
+
+    if (v1.length) {
+      var group1 = createVersionGroup('V1 系列');
+      group1.appendChild(createVersionOption('v1', 'V1 全部（v1.x）'));
+      v1.forEach(function (version) {
+        if (version !== '1') {
+          group1.appendChild(createVersionOption('v' + version, displayVersion(version)));
+        }
+      });
+      select.appendChild(group1);
+    }
+
+    if (v2.length) {
+      var group2 = createVersionGroup('V2 系列');
+      group2.appendChild(createVersionOption('v2', 'V2 全部（v2.x）'));
+      v2.forEach(function (version) {
+        if (version !== '2') {
+          group2.appendChild(createVersionOption('v' + version, displayVersion(version)));
+        }
+      });
+      select.appendChild(group2);
+    }
+
+    if (others.length) {
+      var groupOther = createVersionGroup('其它版本');
+      others.forEach(function (version) {
+        var value = /^\d/.test(version) ? 'v' + version : version;
+        groupOther.appendChild(createVersionOption(value, displayVersion(version)));
+      });
+      select.appendChild(groupOther);
+    }
+
+    var selection = normalizeVersionSelection(state.filterVersion);
+    state.filterVersion = selection;
+    select.value = selection;
+  }
+
+  /* ============================== 记录字段解析 ============================== */
 
   function typeOf(row) {
     if (!row || !E) return null;
@@ -184,9 +379,22 @@
   /* ================================ 筛选 ================================ */
 
   function matchVersion(row) {
-    if (state.filterVersion === 'new') return isNewVersion(row);
-    if (state.filterVersion === 'old') return !isNewVersion(row);
-    return true;
+    var target = state.filterVersion;
+    if (!target || target === 'all') return true;
+    var version = versionOf(row);
+
+    if (target === 'v1') {
+      // v1 系列：survey_version 以 1 开头；没有版本号但 result_code 是四字母的旧记录也算 v1
+      if (version) return seriesOfVersion(version) === '1';
+      return !isMachineRow(row);
+    }
+    if (target === 'v2') {
+      // v2 系列：survey_version 以 2 开头；兼容没有版本号但已是 M01-M08 的数据
+      if (version) return seriesOfVersion(version) === '2';
+      return isMachineRow(row);
+    }
+    // 精确版本：按归一化后的版本号完全相等
+    return version === normalizeVersion(target);
   }
 
   function matchRange(row) {
@@ -202,12 +410,12 @@
 
   function matchType(row) {
     if (state.filterType) {
-      if (!isNewVersion(row)) return false;
+      if (!isMachineRow(row)) return false;
       var type = typeOf(row);
       if (!type || type.id !== state.filterType) return false;
     }
     if (state.filterLegacy) {
-      if (isNewVersion(row)) return false;
+      if (isMachineRow(row)) return false;
       if (String(row.result_code || '') !== state.filterLegacy) return false;
     }
     return true;
@@ -285,7 +493,7 @@
       custom: 'CUSTOM · 自定义接口'
     };
     if (els.statusSource) els.statusSource.textContent = sourceLabels[state.source] || state.source;
-    if (els.statusVersion) els.statusVersion.textContent = CURRENT_VERSION + ' · 8 机体';
+    if (els.statusVersion) els.statusVersion.textContent = rangeLabel();
     if (els.statusEmail) {
       els.statusEmail.textContent = state.email ||
         (state.source === 'local' ? '未登录（本地模式）' : '未登录');
@@ -305,9 +513,9 @@
   /* ================================ KPI ================================ */
 
   var KPI_DEFS = [
-    { key: 'total', label: '总答卷', note: '当前版本 + 时间筛选' },
+    { key: 'total', label: '总答卷', note: '当前版本范围 + 时间筛选' },
     { key: 'today', label: '今日新增', note: '按本机日期统计' },
-    { key: 'newVersion', label: '新版答卷', note: 'survey_version = ' + CURRENT_VERSION },
+    { key: 'newVersion', label: '新版答卷', note: 'M01–M08 机体数据' },
     { key: 'complete', label: '完成答卷率', note: 'answered = total' },
     { key: 'duration', label: '平均用时', note: '含 duration_ms 的记录' },
     { key: 'tie', label: '并列答卷数', note: 'percents.match.tie = true' }
@@ -321,7 +529,7 @@
     rows.forEach(function (row) {
       var d = toDate(row && row.created_at);
       if (d && dayKey(d) === todayKey) today++;
-      if (isNewVersion(row)) newVersion++;
+      if (isMachineRow(row)) newVersion++;
       if (isComplete(row)) complete++;
       if (isTie(row)) tie++;
       var ms = durationOf(row);
@@ -352,11 +560,13 @@
 
   function renderTypeChart(cohort) {
     var types = (E && E.types) || [];
-    var newRows = cohort.filter(isNewVersion);
-    var totalNew = newRows.length;
+    var machineRows = cohort.filter(isMachineRow);
+    var totalMachine = machineRows.length;
+    var legacyCount = cohort.length - totalMachine;
+    var disableRows = isV1Range();
     var counts = {};
 
-    newRows.forEach(function (row) {
+    machineRows.forEach(function (row) {
       var type = typeOf(row);
       if (type) counts[type.id] = (counts[type.id] || 0) + 1;
     });
@@ -364,12 +574,13 @@
     clear(els.typeChart);
     types.forEach(function (type) {
       var n = counts[type.id] || 0;
-      var pct = fmtPct(n, totalNew);
+      var pct = fmtPct(n, totalMachine);
       var row = el('button', 'adm-dist-row');
       row.type = 'button';
       row.setAttribute('data-code', type.id);
       row.setAttribute('aria-pressed', state.filterType === type.id ? 'true' : 'false');
       if (state.filterType === type.id) row.classList.add('is-active');
+      if (disableRows) row.disabled = true;
 
       var name = el('span', 'adm-dist-name');
       name.appendChild(el('span', 'adm-dist-name-text', type.name));
@@ -387,26 +598,20 @@
       val.appendChild(el('i', null, ' · ' + pct + '%'));
       row.appendChild(val);
 
-      row.title = type.name + '：' + n + ' 份（' + pct + '%），点击筛选下方表格';
+      row.title = disableRows
+        ? type.name + '：当前版本范围没有 8 机体数据'
+        : type.name + '：' + n + ' 份（' + pct + '%），点击筛选下方表格';
       els.typeChart.appendChild(row);
     });
 
-    if (!totalNew) {
-      els.typeChart.appendChild(el('p', 'adm-empty', '当前筛选范围内没有新版答卷。'));
+    if (!totalMachine) {
+      els.typeChart.appendChild(el('p', 'adm-empty',
+        '当前版本范围（' + rangeShortLabel() + '）没有 8 机体数据。'));
     }
 
     if (els.typeMeta) {
-      var loadedNew = state.rows.filter(isNewVersion).length;
-      var loadedOld = state.rows.length - loadedNew;
-      var meta;
-      if (state.filterVersion === 'new') {
-        meta = totalNew + ' 份新版' + (loadedOld ? ' · 已隐藏 ' + loadedOld + ' 份旧版' : '');
-      } else if (state.filterVersion === 'old') {
-        meta = cohort.length + ' 份旧版' + (loadedNew ? ' · 已隐藏 ' + loadedNew + ' 份新版' : '');
-      } else {
-        meta = totalNew + ' 份新版 / ' + (cohort.length - totalNew) + ' 份旧版';
-      }
-      els.typeMeta.textContent = meta;
+      els.typeMeta.textContent = totalMachine + ' 份 8 机体' +
+        (legacyCount ? ' · ' + legacyCount + ' 份旧版' : '');
     }
 
     renderLegacyChart(cohort);
@@ -414,17 +619,11 @@
 
   function renderLegacyChart(cohort) {
     if (!els.legacyBlock || !els.legacyChart) return;
-    var visible = state.filterVersion !== 'new';
-    els.legacyBlock.hidden = !visible;
-    if (!visible) return;
-
+    var oldRows = cohort.filter(function (row) { return !isMachineRow(row); });
+    // 所选版本范围内存在四字母旧记录时才显示旧版类型区（v2/v2.0/v2.1 下自动隐藏）
+    els.legacyBlock.hidden = oldRows.length === 0;
     clear(els.legacyChart);
-    var oldRows = cohort.filter(function (row) { return !isNewVersion(row); });
-    if (!oldRows.length) {
-      els.legacyChart.appendChild(el('p', 'adm-empty',
-        '当前数据范围内没有旧版记录（后台只读取最近 ' + FETCH_LIMIT + ' 条）。'));
-      return;
-    }
+    if (!oldRows.length) return;
 
     var groups = {};
     var order = [];
@@ -475,7 +674,7 @@
 
   function renderDimChart(cohort) {
     clear(els.dimChart);
-    var newRows = cohort.filter(isNewVersion);
+    var machineRows = cohort.filter(isMachineRow);
 
     DIM_ORDER.forEach(function (key) {
       var dim = DIMS[key];
@@ -485,7 +684,7 @@
       var sum = 0;
       var n = 0;
 
-      newRows.forEach(function (row) {
+      machineRows.forEach(function (row) {
         var p = row.percents && row.percents[key];
         var v = p ? Number(p.left) : NaN;
         if (isFinite(v)) { sum += v; n++; }
@@ -639,9 +838,8 @@
     });
 
     if (els.trendNote) {
-      var tone = state.filterVersion === 'old' ? '当前为旧版视图' : '当前为新版视图';
       els.trendNote.textContent = '统计口径：按本机日期归档，最近 14 天共 ' + total +
-        ' 条；不受“时间范围”筛选影响（' + tone + '）。';
+        ' 条；不受“时间范围”筛选影响（当前版本范围：' + rangeShortLabel() + '）。';
     }
   }
 
@@ -659,12 +857,12 @@
 
     var version = el('td');
     var versionBadge = el('span', 'adm-ver mono', row.survey_version || '—');
-    if (isNewVersion(row)) versionBadge.classList.add('is-current');
+    if (isCurrentVersionRow(row)) versionBadge.classList.add('is-current');
     version.appendChild(versionBadge);
     tr.appendChild(version);
 
     var result = el('td', 'adm-cell-result');
-    if (isNewVersion(row)) {
+    if (isMachineRow(row)) {
       var type = typeOf(row);
       result.appendChild(el('span', 'adm-result-name',
         (type && type.name) || row.result_name || '未知机体'));
@@ -730,9 +928,13 @@
       var tr = el('tr', 'adm-table-empty');
       var td = el('td');
       td.colSpan = 8;
-      td.textContent = state.rows.length
-        ? '当前筛选条件下没有记录，调整版本 / 时间 / 机体筛选试试。'
-        : (state.loaded ? '暂无数据。' : '正在读取数据…');
+      if (!state.rows.length) {
+        td.textContent = state.loaded ? '暂无数据。' : '正在读取数据…';
+      } else if (!versionRows().length) {
+        td.textContent = '当前版本范围（' + rangeShortLabel() + '）暂无答卷。';
+      } else {
+        td.textContent = '当前筛选条件下没有记录，调整时间 / 机体筛选试试。';
+      }
       tr.appendChild(td);
       tbody.appendChild(tr);
       return;
@@ -743,15 +945,55 @@
 
   /* ============================== 全部渲染 ============================== */
 
+  /** 版本范围联动：v1 系列没有机体编号 → 清空并禁用机体筛选，同时显示提示 */
+  function syncVersionDependentState() {
+    var legacyOnly = isV1Range();
+    if (legacyOnly) state.filterType = '';
+    if (els.filterType) {
+      if (legacyOnly) {
+        els.filterType.value = '';
+        els.filterType.disabled = true;
+        els.filterType.title = '旧版记录没有机体编号，当前版本范围不适用';
+        els.filterType.setAttribute('aria-disabled', 'true');
+      } else {
+        if (els.filterType.value !== (state.filterType || '')) {
+          els.filterType.value = state.filterType || '';
+        }
+        els.filterType.disabled = false;
+        els.filterType.removeAttribute('title');
+        els.filterType.setAttribute('aria-disabled', 'false');
+      }
+    }
+    if (els.filterTypeHint) els.filterTypeHint.hidden = !legacyOnly;
+  }
+
+  /** 所选版本 + 时间范围内没有旧版记录（或旧类型已不存在）时，清空旧版类型筛选 */
+  function clearStaleLegacyFilter(cohort) {
+    var hasLegacy = false;
+    for (var i = 0; i < cohort.length; i++) {
+      if (!isMachineRow(cohort[i])) { hasLegacy = true; break; }
+    }
+    if (!hasLegacy) { state.filterLegacy = ''; return; }
+    if (!state.filterLegacy) return;
+    for (var j = 0; j < cohort.length; j++) {
+      var row = cohort[j];
+      if (!isMachineRow(row) && String(row.result_code || '') === state.filterLegacy) return;
+    }
+    state.filterLegacy = '';
+  }
+
   function renderAll() {
+    syncVersionDependentState();
     var cohort = cohortRows();
+    clearStaleLegacyFilter(cohort);
+    var filtered = cohort.filter(matchType);
     renderStatus();
     renderKpis(cohort);
     renderTypeChart(cohort);
     renderDimChart(cohort);
     renderQuestionStats(cohort);
     renderTrend();
-    renderTable(cohort.filter(matchType));
+    renderTable(filtered);
   }
 
   /* ============================== 数据加载 ============================== */
@@ -787,6 +1029,7 @@
       state.loading = false;
       state.loaded = true;
       setBusy(false);
+      buildVersionFilter();  // 按最新数据重建版本下拉，同时保留当前选择
       renderAll();
       if (opts.successMsg) showNotice(opts.successMsg, 'success', false);
     }, function (err) {
@@ -1083,17 +1326,17 @@
   function renderDetailTitle(row) {
     if (!els.detailTitle) return;
     clear(els.detailTitle);
-    var isNew = isNewVersion(row);
+    var machine = isMachineRow(row);
     var type = typeOf(row);
-    var name = isNew
+    var name = machine
       ? ((type && type.name) || row.result_name || '未知机体')
       : (row.result_name || '旧版类型');
-    var code = isNew
+    var code = machine
       ? ((type && type.id) || row.result_code || '')
       : (row.result_code || '');
     els.detailTitle.appendChild(el('span', 'adm-detail-name', name));
     if (code) {
-      els.detailTitle.appendChild(el('span', 'adm-detail-code mono' + (isNew ? '' : ' is-legacy'), code));
+      els.detailTitle.appendChild(el('span', 'adm-detail-code mono' + (machine ? '' : ' is-legacy'), code));
     }
   }
 
@@ -1275,7 +1518,7 @@
           opt.appendChild(el('span', 'adm-detail-option-text', option.text || ''));
           if (isSelected) {
             opt.appendChild(el('span', 'adm-detail-selected-tag mono', '所选'));
-            var badge = detail ? scoreBadgeText(detail.score, question.dim) : '';
+            var badge = detail ? scoreBadgeText(detail.score || detail.scores, question.dim) : '';
             if (!badge) badge = scoreBadgeText(option.scores, question.dim);
             if (badge) opt.appendChild(el('span', 'adm-detail-score mono', badge));
           }
@@ -1307,7 +1550,7 @@
         var head = el('div', 'adm-detail-old-head');
         head.appendChild(el('span', 'adm-detail-q-id mono',
           item.id ? String(item.id).toUpperCase() : '第 ' + (index + 1) + ' 题'));
-        var badge = scoreBadgeFull(item.score);
+        var badge = scoreBadgeFull(item.score || item.scores);
         if (badge) head.appendChild(el('span', 'adm-detail-score mono', badge));
         li.appendChild(head);
         li.appendChild(el('p', 'adm-detail-old-text', item.text || '（这条记录没有保存答案文本）'));
@@ -1343,7 +1586,7 @@
       els.detailAnswersNote.hidden = true;
       els.detailAnswersNote.textContent = '';
     }
-    if (isNewVersion(row)) renderNewAnswers(row, container);
+    if (isMachineRow(row)) renderNewAnswers(row, container);
     else renderLegacyAnswers(row);
   }
 
@@ -1554,12 +1797,12 @@
   }
 
   function onVersionChange(event) {
-    state.filterVersion = event.target.value;
+    var raw = event && event.target ? event.target.value : '';
+    var selection = normalizeVersionSelection(raw);
+    state.filterVersion = selection;
     state.filterLegacy = '';
-    if (state.filterVersion === 'old') {
-      // 旧版数据没有 8 机体编号，清掉机体筛选避免空表
-      state.filterType = '';
-      if (els.filterType) els.filterType.value = '';
+    if (event && event.target && event.target.value !== selection) {
+      try { event.target.value = selection; } catch (e) { /* ignore */ }
     }
     renderAll();
   }
@@ -1648,6 +1891,7 @@
     els.filterVersion = $('filterVersion');
     els.filterRange = $('filterRange');
     els.filterType = $('filterType');
+    els.filterTypeHint = $('filterTypeHint');
     els.notice = $('notice');
     els.modeBanner = $('modeBanner');
     els.statusSource = $('statusSource');
@@ -1739,6 +1983,7 @@
 
     bindEvents();
     buildTypeFilter();
+    buildVersionFilter();  // 首屏先用「已知版本」生成下拉，载入数据后会再次重建
 
     if (els.footerTable) {
       var tableName = (CFG.supabase && CFG.supabase.table) || 'ai_personality_responses';
